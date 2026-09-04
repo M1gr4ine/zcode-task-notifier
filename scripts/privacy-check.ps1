@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [switch]$History
 )
@@ -233,7 +233,10 @@ function Get-IgnoredRuntimeFiles {
         }
     }
     finally {
-        Stop-GitProcessIfRunning -Process $process
+        if ($null -ne $process -and -not $process.HasExited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
         $process.Dispose()
     }
 }
@@ -278,7 +281,10 @@ function Get-WorkingTreeFiles {
         }
     }
     finally {
-        Stop-GitProcessIfRunning -Process $process
+        if ($null -ne $process -and -not $process.HasExited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
         $process.Dispose()
     }
 
@@ -359,19 +365,6 @@ function Read-StreamBytes {
     }
 }
 
-function Stop-GitProcessIfRunning {
-    param([Diagnostics.Process]$Process)
-    try {
-        if ($null -ne $Process -and -not $Process.HasExited) {
-            $Process.Kill()
-            $Process.WaitForExit()
-        }
-    }
-    catch {
-        # 进程清理失败仍由调用方输出固定 PRIVACY_CHECK_ERROR。
-    }
-}
-
 function Get-HistoryObjectMetadata {
     param([string]$ObjectId)
     $startInfo = New-GitProcessStartInfo '-C {repoRoot} cat-file --batch-check'
@@ -416,7 +409,10 @@ function Get-HistoryObjectMetadata {
         return $null
     }
     finally {
-        Stop-GitProcessIfRunning -Process $process
+        if ($null -ne $process -and -not $process.HasExited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
         $process.Dispose()
     }
 }
@@ -489,7 +485,10 @@ function Get-HistoryBlobText {
         return $null
     }
     finally {
-        Stop-GitProcessIfRunning -Process $process
+        if ($null -ne $process -and -not $process.HasExited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
         $process.Dispose()
     }
 }
@@ -545,7 +544,10 @@ function Scan-GitHistory {
         }
     }
     finally {
-        Stop-GitProcessIfRunning -Process $process
+        if ($null -ne $process -and -not $process.HasExited) {
+            $process.Kill()
+            $process.WaitForExit()
+        }
         $process.Dispose()
     }
 }

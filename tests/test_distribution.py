@@ -400,6 +400,45 @@ def test_privacy_scans_streams_instead_of_materializing_worktree_or_history():
     assert "foreach ($path in @(Get-WorkingTreeFiles))" not in privacy
 
 
+def test_privacy_checker_keeps_utf8_bom_for_windows_powershell_51():
+    checker = (repo_root() / "scripts/privacy-check.ps1").read_bytes()
+    assert checker.startswith(b"\xef\xbb\xbf")
+
+
+@pytest.mark.parametrize("history", [False, True])
+def test_privacy_powershell_51_handles_realistic_public_file_count(
+    tmp_path: Path, history: bool
+):
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        if os.name == "nt":
+            pytest.fail("Windows PowerShell 5.1 is required on Windows")
+        pytest.skip("Windows PowerShell 5.1 unavailable on non-Windows")
+
+    root = tmp_path / ("privacy-ps51-history" if history else "privacy-ps51-current")
+    root.mkdir()
+    _init_privacy_fixture(root)
+    for source in tracked_candidate_files(repo_root()):
+        relative = source.relative_to(repo_root())
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if relative != Path("scripts/privacy-check.ps1"):
+            target.write_bytes(source.read_bytes())
+    if history:
+        _commit_fixture(root, "synthetic public snapshot")
+
+    arguments = ("-History",) if history else ()
+    result = _run_privacy_fixture(root, *arguments)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    expected = (
+        "工作树与 Git 历史隐私检查通过" if history else "隐私检查通过"
+    )
+    assert result.stdout.strip() == expected
+    assert result.stderr == ""
+    assert str(root) not in result.stdout + result.stderr
+
+
 def test_privacy_unc_requires_server_and_share_components(tmp_path: Path):
     root = tmp_path / "privacy-unc-shape"
     root.mkdir()
