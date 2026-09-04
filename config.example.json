@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "zcode_home": "auto",
+  "notification_workspace": "auto",
+  "codex_enabled": false,
+  "codex_home": "auto",
+  "interval_seconds": 60,
+  "model": "builtin:bigmodel-coding-plan/GLM-5-Turbo",
+  "codex_prefix": "[codex]",
+  "outbox_retention_days": 7
+}
