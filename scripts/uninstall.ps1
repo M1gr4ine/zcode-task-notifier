@@ -138,6 +138,10 @@ function Test-TaskNotFoundError {
     if ($exception.GetType().FullName -match 'TaskNotFound') {
         return $true
     }
+    $errorId = [string]$ErrorRecord.FullyQualifiedErrorId
+    if ($errorId.StartsWith("CmdletizationQuery_NotFound", [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
     # Task Scheduler reports a missing task as ERROR_FILE_NOT_FOUND.
     return [int64]$exception.HResult -eq -2147024894
 }

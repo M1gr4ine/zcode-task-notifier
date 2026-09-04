@@ -533,6 +533,16 @@ def test_uninstaller_requires_task_not_found_and_action_root_match_before_unregi
     assert "catch {\n        return" not in body
 
 
+def test_installer_and_uninstaller_accept_windows_cim_task_not_found_shape():
+    for relative in ("scripts/install.ps1", "scripts/uninstall.ps1"):
+        script = (repo_root() / relative).read_text(encoding="utf-8")
+        start = script.index("function Test-TaskNotFoundError")
+        end = script.index("\nfunction ", start + 1)
+        detector = script[start:end]
+        assert "FullyQualifiedErrorId" in detector
+        assert "CmdletizationQuery_NotFound" in detector
+
+
 def test_uninstaller_rejects_descendant_reparse_points_before_recursive_delete():
     uninstaller = (repo_root() / "scripts/uninstall.ps1").read_text(encoding="utf-8")
     assert "Assert-NoDescendantReparsePoints" in uninstaller
@@ -755,6 +765,85 @@ def test_installer_rollback_suspends_current_then_restores_files_and_tasks():
     assert rollback.index("Restore-InstallFiles") < rollback.index(
         "Restore-LegacyTaskRecords"
     )
+
+
+def test_installer_reports_only_a_fixed_failure_stage_and_exception_type():
+    installer = (repo_root() / "scripts/install.ps1").read_text(encoding="utf-8")
+    expected_stages = (
+        "preflight-python",
+        "preflight-weixin",
+        "preflight-codex",
+        "filesystem-prepare",
+        "task-backup",
+        "config-write",
+        "app-stage",
+        "state-migrate",
+        "state-baseline",
+        "app-switch",
+        "task-register",
+        "doctor",
+        "trigger-verify",
+        "legacy-suspend",
+        "cleanup",
+    )
+    for stage in expected_stages:
+        assert f'$script:InstallStage = "{stage}"' in installer
+
+    catch_body = installer[installer.index("catch {", installer.index("try {\n    Invoke-Install")) :]
+    assert "$failedStage = $script:InstallStage" in catch_body
+    assert "stage=" in catch_body
+    assert "$_.Exception.GetType().Name" in catch_body
+    assert "$_.Exception.Message" not in catch_body
+    assert "[Console]::Error.WriteLine" in catch_body
+    assert "Write-Error" not in catch_body
+
+    install_body = installer[installer.index("function Invoke-Install") :]
+    assert install_body.index('$script:InstallStage = "preflight-python"') < install_body.index(
+        "$sourcePackage ="
+    )
+    assert install_body.index('$script:InstallStage = "preflight-codex"') < install_body.index(
+        "$codexEnabled = Select-Codex"
+    )
+
+
+def test_installer_preflight_uses_requested_checks_even_when_doctor_is_unhealthy(
+    tmp_path: Path,
+):
+    source = repo_root() / "scripts/install.ps1"
+    harness = r'''
+param([string]$Source, [string]$Probe)
+$sourceText = [IO.File]::ReadAllText($Source)
+$sourceDir = Split-Path -Parent $Source
+$sourceText = $sourceText.Replace('$PSScriptRoot', "'" + $sourceDir.Replace("'", "''") + "'")
+$marker = [char]10 + 'try {' + [char]10 + '    Invoke-Install'
+$index = $sourceText.LastIndexOf($marker)
+if ($index -lt 0) { throw 'definitions-not-found' }
+. ([scriptblock]::Create($sourceText.Substring(0, $index)))
+
+function New-ProbeConfig {
+    param([bool]$CodexEnabled)
+    [IO.File]::WriteAllText($Probe, '{}')
+    return $Probe
+}
+function Invoke-PythonModule {
+    param([string]$ModuleRoot, [string[]]$Arguments, [switch]$Capture)
+    $payload = @{
+        checks = @{
+            weixin_target = $true
+            codex_discovered = $true
+            codex_source = $true
+            state_valid = $false
+        }
+    } | ConvertTo-Json -Compress
+    return [pscustomobject]@{ Output = $payload; ExitCode = 2 }
+}
+if (-not (Test-WeixinTarget -CodexEnabled $true)) { throw 'target-check-failed' }
+'PASS'
+'''
+    probe = tmp_path / "probe.json"
+    result = _run_powershell_harness(tmp_path, harness, str(source), str(probe))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith("PASS")
 
 
 def test_installer_rollback_suspends_current_task_with_isolated_cmdlet_mocks(

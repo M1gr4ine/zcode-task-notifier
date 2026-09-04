@@ -416,16 +416,41 @@ def _load_state_metadata(codex_home: Path, state_db: Path | None) -> _CodexMetad
                 sources[thread_id] = None
 
         refs_by_key: dict[tuple[str, str], RolloutRef] = {}
+        unsafe_paths: list[CodexSourceError] = []
+        unsafe_thread_ids: set[str] = set()
         for row in rows:
             if not _source_is_user(sources.get(row.thread_id)):
                 continue
-            path = _safe_rollout_path(root, str(row.path))
+            try:
+                path = _safe_rollout_path(root, str(row.path))
+            except CodexSourceError as exc:
+                # 状态库可能保留已迁移安装或旧版本的绝对路径。绝不读取越界
+                # 文件；有受限根内来源时仅跳过坏行，全部越界时仍失败关闭。
+                unsafe_paths.append(exc)
+                unsafe_thread_ids.add(row.thread_id)
+                continue
             title = row.title or titles.get(row.thread_id, "") or catalog_titles.get(row.thread_id, "")
             ref = RolloutRef(row.thread_id, _normalise_title(title, row.thread_id), path)
             key = (row.thread_id, str(path))
             previous = refs_by_key.get(key)
             if previous is None or previous.title == _normalise_title("", row.thread_id):
                 refs_by_key[key] = ref
+
+        if unsafe_thread_ids:
+            fallback_titles = dict(catalog_titles)
+            fallback_titles.update(titles)
+            for ref in _discover_session_files(
+                root,
+                fallback_titles,
+                sources,
+                thread_ids=unsafe_thread_ids,
+            ):
+                refs_by_key.setdefault((ref.thread_id, str(ref.path)), ref)
+
+        if unsafe_paths and not refs_by_key:
+            raise unsafe_paths[0]
+        if unsafe_paths:
+            _LOGGER.warning("codex state 越界路径已跳过: count=%d", len(unsafe_paths))
 
         if not matched_state_schema:
             raise CodexSourceError("Codex 状态库 schema 缺少 thread 与 rollout 路径字段")
@@ -473,16 +498,28 @@ def _discover_session_files(
     codex_home: Path,
     catalog_titles: Mapping[str, str] | None = None,
     sources: Mapping[str, str | None] | None = None,
+    thread_ids: set[str] | None = None,
 ) -> list[RolloutRef]:
     refs: dict[tuple[str, str], RolloutRef] = {}
     diagnostics: list[CodexSourceError] = []
     candidates: list[Path] = []
+    selected_ids = {
+        value.casefold() for value in (thread_ids or set()) if value.strip()
+    }
     for directory_name in ("sessions", "workspaces"):
         directory = codex_home / directory_name
         if not directory.is_dir():
             continue
         try:
-            candidates.extend(item for item in directory.rglob("*.jsonl") if item.is_file())
+            candidates.extend(
+                item
+                for item in directory.rglob("*.jsonl")
+                if item.is_file()
+                and (
+                    not selected_ids
+                    or any(value in item.name.casefold() for value in selected_ids)
+                )
+            )
         except OSError as exc:
             raise CodexSourceError(f"无法遍历 Codex {directory_name} 目录") from exc
     candidates.sort()
@@ -500,6 +537,8 @@ def _discover_session_files(
             _LOGGER.warning("codex session 文件处理失败: %s", type(exc).__name__)
             continue
         if not thread_id:
+            continue
+        if selected_ids and thread_id.casefold() not in selected_ids:
             continue
         source = sources.get(thread_id) if sources is not None else None
         if not _source_is_user(source):
@@ -965,7 +1004,14 @@ def scan_codex_events(
                 events.append(event)
 
     if history_db is not None:
-        history_rows = _load_history_rows(Path(history_db), metadata.titles, metadata.sources)
+        try:
+            history_rows = _load_history_rows(
+                Path(history_db), metadata.titles, metadata.sources
+            )
+        except CodexSourceError as exc:
+            diagnostics.append(exc)
+            history_rows = []
+            _LOGGER.warning("codex 可选历史库处理失败: %s", type(exc).__name__)
         history_keys: set[str] = set()
         for row in history_rows:
             event = _history_event(row, starts)

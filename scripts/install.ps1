@@ -30,6 +30,7 @@ $script:StateExisted = $false
 $script:LegacyTaskRecords = @()
 $script:LegacyTaskWarnings = @()
 $script:NotifierTriggerAt = $null
+$script:InstallStage = "bootstrap"
 
 function Get-LocalApplicationData {
     $value = [Environment]::GetFolderPath('LocalApplicationData')
@@ -179,7 +180,9 @@ function Test-WeixinTarget {
     try {
         $arguments = @("-m", "zcode_task_notifier", "doctor", "--config", $probe, "--json")
         $result = Invoke-PythonModule -ModuleRoot (Join-Path $script:SourceRoot "src") -Arguments $arguments -Capture
-        if ($result.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($result.Output)) {
+        # doctor 的整体退出码还包含 state/source 等安装后检查；预检只消费
+        # 下方明确列出的只读目标检查，避免无关项把可用目标误判为失败。
+        if ([string]::IsNullOrWhiteSpace($result.Output)) {
             return $false
         }
         try {
@@ -343,6 +346,10 @@ function Test-TaskNotFoundError {
         return $true
     }
     if ($exception.GetType().FullName -match 'TaskNotFound') {
+        return $true
+    }
+    $errorId = [string]$ErrorRecord.FullyQualifiedErrorId
+    if ($errorId.StartsWith("CmdletizationQuery_NotFound", [StringComparison]::OrdinalIgnoreCase)) {
         return $true
     }
     return [int64]$exception.HResult -eq -2147024894
@@ -829,17 +836,21 @@ function Restore-InstallFiles {
 }
 
 function Invoke-Install {
+    $script:InstallStage = "preflight-python"
     $sourcePackage = Join-Path $script:SourceRoot "src\zcode_task_notifier"
     if (-not (Test-Path -LiteralPath $sourcePackage -PathType Container)) {
         throw "The source package is incomplete"
     }
     $script:Python = Find-Python
+    $script:InstallStage = "preflight-weixin"
     Confirm-Weixin
+    $script:InstallStage = "preflight-codex"
     $codexEnabled = Select-Codex
     if ($codexEnabled -and -not (Test-WeixinTarget -CodexEnabled $true)) {
         throw "The source check before enabling Codex did not pass"
     }
 
+    $script:InstallStage = "filesystem-prepare"
     $script:InstallRoot = Resolve-InstallRoot -Value $InstallDir
     if (Test-Path -LiteralPath $script:InstallRoot) {
         $installItem = Get-Item -LiteralPath $script:InstallRoot -Force
@@ -857,6 +868,7 @@ function Invoke-Install {
     New-Item -ItemType Directory -Path $script:BackupRoot -Force | Out-Null
 
     # 旧产品任务必须在首次改写配置、状态或应用前完成备份并暂停。
+    $script:InstallStage = "task-backup"
     Save-ExistingTaskXml -Directory $script:BackupRoot -Root $script:InstallRoot | Out-Null
     if (Test-Path -LiteralPath $appPath) {
         $appItem = Get-Item -LiteralPath $appPath -Force
@@ -876,25 +888,32 @@ function Invoke-Install {
         $script:StateBackup = Join-Path $script:BackupRoot "state.json"
         Copy-Item -LiteralPath $statePath -Destination $script:StateBackup
     }
+    $script:InstallStage = "config-write"
     $config = Read-OrCreateConfig -Path $configPath -CodexEnabled $codexEnabled
     Write-JsonAtomic -Path $configPath -Value $config
 
+    $script:InstallStage = "app-stage"
     $stageApp = Join-Path $script:StageRoot "app"
     New-Item -ItemType Directory -Path $stageApp -Force | Out-Null
     Copy-Item -LiteralPath (Join-Path $script:SourceRoot "src\zcode_task_notifier") -Destination $stageApp -Recurse
 
     $snapshot = Get-MigrationSnapshot
     if ($null -ne $snapshot) {
+        $script:InstallStage = "state-migrate"
         Invoke-PythonModule -ModuleRoot $stageApp -Arguments @("-m", "zcode_task_notifier", "migrate", "--snapshot", $snapshot, "--state", $statePath)
     }
+    $script:InstallStage = "state-baseline"
     Invoke-PythonModule -ModuleRoot $stageApp -Arguments @("-m", "zcode_task_notifier", "baseline", "--config", $configPath, "--state", $statePath, "--json")
 
+    $script:InstallStage = "app-switch"
     if (Test-Path -LiteralPath $appPath) {
         throw "The old application is still present before the directory switch"
     }
     Move-Item -LiteralPath $stageApp -Destination $appPath
     $script:AppSwitched = $true
+    $script:InstallStage = "task-register"
     Register-NotifierTask -AppPath $appPath -ConfigPath $configPath -StatePath $statePath
+    $script:InstallStage = "doctor"
     $doctorResult = Invoke-PythonModule -ModuleRoot $appPath -Arguments @("-m", "zcode_task_notifier", "doctor", "--config", $configPath, "--state", $statePath, "--json") -Capture
     if ($doctorResult.ExitCode -ne 0 -or [string]::IsNullOrWhiteSpace($doctorResult.Output)) {
         throw "doctor-check-failed"
@@ -908,10 +927,13 @@ function Invoke-Install {
     catch {
         throw "doctor-payload-invalid"
     }
+    $script:InstallStage = "trigger-verify"
     Assert-NotifierTaskTrigger
     # 新任务已完成 doctor，且首个 trigger 至少在一分钟后；最后才提交旧 watcher 停用。
+    $script:InstallStage = "legacy-suspend"
     Suspend-VerifiedLegacyTasks -Directory $script:BackupRoot
 
+    $script:InstallStage = "cleanup"
     if (Test-Path -LiteralPath $script:StageRoot) {
         Remove-Item -LiteralPath $script:StageRoot -Recurse -Force
     }
@@ -928,6 +950,8 @@ try {
     exit 0
 }
 catch {
+    $failedStage = $script:InstallStage
+    $failureType = $_.Exception.GetType().Name
     $rollbackFailed = $false
     try {
         Suspend-CurrentNotifierTask
@@ -962,8 +986,8 @@ catch {
         $rollbackFailed = $true
     }
     if ($rollbackFailed) {
-        Write-Error "Rollback did not complete"
+        [Console]::Error.WriteLine("Rollback did not complete")
     }
-    Write-Error ("Installation failed: " + $_.Exception.GetType().Name)
+    [Console]::Error.WriteLine("Installation failed: " + $failureType + "; stage=" + $failedStage)
     exit 1
 }

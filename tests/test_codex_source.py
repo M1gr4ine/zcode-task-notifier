@@ -419,6 +419,48 @@ def test_rollout_path_outside_codex_home_is_rejected(tmp_path: Path):
         discover_rollouts(codex_home, state_db)
 
 
+def test_unsafe_state_row_is_ignored_when_a_confined_rollout_exists(tmp_path: Path):
+    codex_home, state_db, safe_rollout = make_codex_layout(tmp_path, "thread-safe")
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("{}\n", encoding="utf-8")
+    connection = sqlite3.connect(state_db)
+    connection.execute(
+        "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?)",
+        ("thread-outside", "越界记录", str(outside), "user", "任意 cwd", "任意 project"),
+    )
+    connection.commit()
+    connection.close()
+
+    refs = discover_rollouts(codex_home, state_db)
+
+    assert [(ref.thread_id, ref.path) for ref in refs] == [
+        ("thread-safe", safe_rollout.resolve())
+    ]
+
+
+def test_unsafe_state_path_recovers_matching_copy_inside_sessions(tmp_path: Path):
+    thread_id = "thread-relocated"
+    codex_home, state_db, original = make_codex_layout(tmp_path, thread_id)
+    outside = tmp_path / "outside.jsonl"
+    outside.write_text("{}\n", encoding="utf-8")
+    connection = sqlite3.connect(state_db)
+    connection.execute("UPDATE threads SET rollout_path = ?", (str(outside),))
+    connection.commit()
+    connection.close()
+    safe_copy = codex_home / "sessions" / f"rollout-date-{thread_id}.jsonl"
+    append_jsonl(safe_copy, {"type": "session_meta", "payload": {"id": thread_id}})
+    append_jsonl(safe_copy, complete_record("turn-relocated", "迁移后的完成消息"))
+
+    refs = discover_rollouts(codex_home, state_db)
+    event = backfill_codex_thread(codex_home, state_db, None, thread_id)
+
+    assert original != safe_copy
+    assert [(ref.thread_id, ref.path) for ref in refs] == [
+        (thread_id, safe_copy.resolve())
+    ]
+    assert event.turn_id == "turn-relocated"
+
+
 def test_first_scan_baselines_rollout_at_eof(tmp_path: Path):
     codex_home, state_db, rollout = make_codex_layout(tmp_path, "thread-example")
     append_jsonl(rollout, complete_record("turn-example", "历史完成"))
@@ -674,6 +716,28 @@ def test_invalid_history_database_schema_fails_closed(tmp_path: Path):
 
     with pytest.raises(CodexSourceError, match="schema"):
         scan_codex_events(codex_home, state_db, history_db, RuntimeState(initialized=True), baseline=False)
+
+
+def test_invalid_optional_history_does_not_block_a_valid_rollout(tmp_path: Path):
+    codex_home, state_db, rollout = make_codex_layout(tmp_path, "thread-rollout")
+    append_jsonl(rollout, complete_record("turn-rollout", "权威 rollout 答案"))
+    history_db = codex_home / "thread_history_example.sqlite"
+    connection = sqlite3.connect(history_db)
+    connection.execute("CREATE TABLE unrelated (id TEXT PRIMARY KEY)")
+    connection.commit()
+    connection.close()
+
+    events, _, _ = scan_codex_events(
+        codex_home,
+        state_db,
+        history_db,
+        RuntimeState(initialized=True),
+        baseline=False,
+    )
+
+    assert [(event.task_id, event.turn_id) for event in events] == [
+        ("thread-rollout", "turn-rollout")
+    ]
 
 
 def test_backfill_returns_latest_completion_for_exact_thread_only(tmp_path: Path):
