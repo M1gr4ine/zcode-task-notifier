@@ -8,14 +8,6 @@ from pathlib import Path
 from typing import Mapping
 
 from .history_cleanup import CleanupReport, HistoryCleanupError, cleanup_history
-from .history_ownership import (
-    HISTORY_OWNERSHIP_FILENAME,
-    HistoryOwnershipError,
-    load_history_ownership,
-    merge_history_ownership,
-    ownership_signature,
-    save_history_ownership,
-)
 from .models import OutboxItem
 
 
@@ -66,32 +58,11 @@ def run_history_cleanup(
     state_path: Path,
     now_ms: int,
 ) -> CleanupReport:
-    """执行保留十条规则，并为实际软删除持久化 intent/committed 审计。
-
-    intent 由 ``cleanup_history`` 在持锁事务内调用，因此该记录无法写入时
-    不会发生数据库删除。数据库提交后再写 committed；若该后置写入失败，
-    直接报告已提交而不尝试宣称回滚。
-    """
+    """执行合计保留五条规则，并为实际软删除持久化审计。"""
     if not isinstance(now_ms, int) or isinstance(now_ms, bool) or now_ms < 0:
         raise ValueError("now_ms 必须是非负整数")
 
     audit_path = Path(state_path).parent / _AUDIT_FILENAME
-    ownership_path = Path(state_path).parent / HISTORY_OWNERSHIP_FILENAME
-
-    def skip_cleanup() -> CleanupReport:
-        # 归属账本损坏或无法持久化时保持 fail-closed；空 outbox 不会打开或
-        # 写入数据库，只构造一个可由调用方忽略的零删除报告。
-        return cleanup_history(Path(db_path), {}, Path(workspace), keep=10)
-
-    try:
-        existing_ownership = load_history_ownership(ownership_path)
-        merged_ownership = merge_history_ownership(existing_ownership, outbox)
-        if ownership_signature(merged_ownership) != ownership_signature(
-            existing_ownership
-        ):
-            save_history_ownership(ownership_path, merged_ownership)
-    except HistoryOwnershipError:
-        return skip_cleanup()
 
     def write_intent(report: CleanupReport) -> None:
         _append_audit_record(audit_path, report, now_ms=now_ms, phase="intent")
@@ -99,9 +70,9 @@ def run_history_cleanup(
     try:
         report = cleanup_history(
             Path(db_path),
-            merged_ownership,
+            outbox,
             Path(workspace),
-            keep=10,
+            keep=5,
             before_delete=write_intent,
         )
     except HistoryCleanupError as exc:
@@ -120,7 +91,7 @@ def run_history_cleanup(
             phase="committed",
         )
     except HistoryAuditError as exc:
-        raise HistoryAuditError("历史删除已提交，但 committed 审计写入失败") from exc
+        raise HistoryAuditError("历史删除已提交，committed 审计写入失败") from exc
     return report
 
 

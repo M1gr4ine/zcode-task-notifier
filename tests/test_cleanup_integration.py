@@ -16,7 +16,7 @@ def native_fixture(tmp_path, monkeypatch):
     state = RuntimeState(initialized=True)
     workspace = fixture.zcode_home / "workspace-example"
     with sqlite3.connect(fixture.zcode_db) as connection:
-        for index in range(11):
+        for index in range(6):
             event, _, _ = _add_candidate(connection, workspace, index)
             state.outbox[event.key] = _outbox_item(event)
             state.seen_event_keys.add(event.key)
@@ -32,7 +32,7 @@ def test_main_loop_cleans_owned_history_before_outbox_expiry(tmp_path, monkeypat
     assert report.enqueued == 0
     assert len(_deleted_tasks(fixture.zcode_db)) == 1
     assert StateStore(fixture.state_path).load().outbox == {}
-    assert (tmp_path / "history-ownership.json").exists()
+    assert not (tmp_path / "history-ownership.json").exists()
     assert service.run_once(fixture.config_path, fixture.state_path, now_ms=9 * 86400000).cleanup_deleted == 0
 
 

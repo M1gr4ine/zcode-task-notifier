@@ -1,8 +1,8 @@
-"""按通知器归属安全软删除 ZCode 任务历史。"""
+"""按自动化归属安全软删除 ZCode 任务历史。"""
 
 from __future__ import annotations
 
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from hashlib import sha256
 import json
@@ -36,33 +36,30 @@ class CleanupReport:
 
 
 @dataclass(frozen=True)
-class _OwnedEvent:
-    source: str
-    automation_id: str
-    event_task_id: str
-    completed_at_ms: int
-
-
-@dataclass(frozen=True)
 class _Candidate:
-    source: str
     automation_id: str
-    event_task_id: str
-    event_completed_at_ms: int
     task_id: str
     task_created_at: int
     task_updated_at: int
+    task_workspace_key: str
+    task_workspace_path: str
 
+
+_AGENT_TAGS = frozenset({"codex", "zcode", "claudecode", "dsh"})
+_AWAITING_STATUSES = frozenset({"awaiting_approval", "awaiting_input"})
+_TERMINAL_TASK_STATUSES = frozenset({"completed", "error"})
+_ACTIVE_DISPATCH_STATUSES = frozenset(
+    {"claimed", "running", "dispatching", "pending", "queued", "retry", "retrying"}
+)
 
 _TASK_COLUMNS = frozenset(
     {
         "workspace_key",
         "workspace_path",
+        "workspace_identity",
         "task_id",
+        "title",
         "task_status",
-        "pinned",
-        "archived",
-        "title_overridden",
         "created_at",
         "updated_at",
         "deleted",
@@ -73,28 +70,17 @@ _AUTOMATION_COLUMNS = frozenset(
     {
         "automation_id",
         "title",
-        "workspace_key",
         "workspace_path",
-        "target_task_id",
-        "recurring",
-        "max_runs",
-        "schedule_edited_by_user",
-        "enabled",
-        "lifecycle_status",
-        "next_run_at",
+        "workspace_identity",
         "running",
         "claimed_at",
         "dispatch_status",
-        "created_at",
-        "updated_at",
     }
 )
 _GROUP_MEMBER_COLUMNS = frozenset({"workspace_key", "task_id"})
 _GROUP_ORDER_COLUMNS = frozenset({"node_type", "node_key"})
-_TERMINAL_STATUSES = frozenset({"completed", "error"})
-_TERMINAL_LIFECYCLES = frozenset({"completed", "failed"})
-_TERMINAL_DISPATCHES = frozenset(
-    {"idle", "dispatched", "failed_to_dispatch", "skipped"}
+_SCHEMA_TABLES = frozenset(
+    {"tasks", "automations", "task_group_members", "task_group_view_node_orders"}
 )
 
 
@@ -113,12 +99,7 @@ def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
 
 
 def _table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
-    if table not in {
-        "tasks",
-        "automations",
-        "task_group_members",
-        "task_group_view_node_orders",
-    }:
+    if table not in _SCHEMA_TABLES:
         raise HistorySchemaError("历史清理 schema 不兼容")
     try:
         rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
@@ -139,6 +120,8 @@ def _validate_schema(connection: sqlite3.Connection) -> bool:
 
     members_exists = _table_exists(connection, "task_group_members")
     orders_exists = _table_exists(connection, "task_group_view_node_orders")
+    if members_exists != orders_exists:
+        raise HistorySchemaError("历史清理 schema 不兼容")
     if members_exists and not _GROUP_MEMBER_COLUMNS.issubset(
         _table_columns(connection, "task_group_members")
     ):
@@ -150,13 +133,17 @@ def _validate_schema(connection: sqlite3.Connection) -> bool:
     return members_exists and orders_exists
 
 
-def _source_title_matches(source: str, title: Any) -> bool:
+def _agent_tag_matches(title: Any) -> bool:
+    """只接受固定 Agent 标签，避免把普通业务方括号当作归属。"""
     if not isinstance(title, str):
         return False
-    normalized = title.strip().casefold()
-    if source == "codex":
-        return normalized.startswith("[codex]")
-    return source == "zcode" and normalized.startswith("[zcode]")
+    normalized = title.casefold()
+    return any(f"[{tag}]" in normalized for tag in _AGENT_TAGS)
+
+
+def _source_title_matches(source: str, title: Any) -> bool:
+    """保留旧内部辅助函数的兼容形态；新清理不按 source 限制。"""
+    return source.casefold() in _AGENT_TAGS and _agent_tag_matches(title)
 
 
 def _connect_rw(path: Path) -> sqlite3.Connection:
@@ -178,54 +165,52 @@ def _record_skip(skipped: Counter[str], reason: str) -> None:
     skipped[reason] += 1
 
 
-def _owned_events(
-    outbox: Mapping[str, OutboxItem], skipped: Counter[str]
-) -> dict[str, _OwnedEvent]:
-    owned: dict[str, _OwnedEvent] = {}
+def _awaiting_automation_ids(outbox: Mapping[str, OutboxItem]) -> set[str]:
+    """仅用内存停顿事件保护等待中的自动化，不承担历史归属判定。"""
+    protected: set[str] = set()
     for map_key, item in outbox.items():
         event = getattr(item, "event", None)
-        if not isinstance(event, Event):
-            _record_skip(skipped, "outbox_invalid")
+        if not isinstance(event, Event) or map_key != event.key:
             continue
-        if map_key != event.key:
-            _record_skip(skipped, "outbox_key")
+        if event.status not in _AWAITING_STATUSES:
             continue
-        if item.status != "submitted":
-            _record_skip(skipped, "outbox_not_submitted")
-            continue
-        if event.source not in {"zcode", "codex"}:
-            _record_skip(skipped, "source")
-            continue
-        if event.status not in _TERMINAL_STATUSES:
-            _record_skip(skipped, "event_not_terminal")
-            continue
-        if not isinstance(event.completed_at_ms, int) or isinstance(
-            event.completed_at_ms, bool
-        ) or event.completed_at_ms < 0 or not isinstance(event.task_id, str) or not event.task_id.strip():
-            _record_skip(skipped, "event_invalid")
+        value = getattr(item, "automation_id", None)
+        if not isinstance(value, str) or not value:
             continue
         try:
-            expected_id = automation_id(event.key)
+            expected = automation_id(event.key)
         except (TypeError, ValueError):
-            _record_skip(skipped, "outbox_automation_id")
             continue
-        if item.automation_id != expected_id:
-            _record_skip(skipped, "outbox_automation_id")
-            continue
-        if expected_id in owned:
-            _record_skip(skipped, "outbox_duplicate")
-            continue
-        owned[expected_id] = _OwnedEvent(
-            source=event.source,
-            automation_id=expected_id,
-            event_task_id=event.task_id,
-            completed_at_ms=event.completed_at_ms,
-        )
-    return owned
+        if value == expected:
+            protected.add(value)
+    return protected
 
 
-def _report_hash(workspace_key: str, task_ids: list[str]) -> str:
-    values = sorted(f"{workspace_key}\0{task_id}" for task_id in task_ids)
+def _flag_enabled(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().casefold() in {
+            "1",
+            "true",
+            "yes",
+            "active",
+            "claimed",
+            "running",
+        }
+    return value is not None
+
+
+def _has_claim(value: Any) -> bool:
+    return value is not None and (not isinstance(value, str) or bool(value.strip()))
+
+
+def _candidate_hash(candidates: list[_Candidate]) -> str:
+    values = sorted(
+        f"{item.task_workspace_key}\0{item.task_id}" for item in candidates
+    )
     return sha256("\n".join(values).encode("utf-8")).hexdigest()
 
 
@@ -234,34 +219,25 @@ def cleanup_history(
     outbox: Mapping[str, OutboxItem],
     workspace: Path,
     *,
-    keep: int = 10,
+    keep: int = 5,
     before_delete: Callable[[CleanupReport], None] | None = None,
 ) -> CleanupReport:
-    """只软删除本产品已提交且已结束的通知 task 历史。
+    """按自动化关联和固定 Agent 标签清理历史，默认合计保留最新五条。
 
-    发生删除时必须先在持锁事务内调用 ``before_delete``，由上层持久化
-    删除审计；回调失败则整个事务回滚。
+    归属不依赖 outbox 或历史账本；outbox 只用于保护当前等待审批/输入的自动化。
+    发生删除时必须先在持锁事务内调用 ``before_delete``，回调失败则事务回滚。
     """
-    if isinstance(keep, bool) or not isinstance(keep, int) or keep < 10:
-        raise ValueError("keep 必须大于等于 10")
+    if isinstance(keep, bool) or not isinstance(keep, int) or keep < 5:
+        raise ValueError("keep 必须大于等于 5")
 
-    workspace_key, workspace_path = _workspace_values(workspace)
+    _, workspace_path = _workspace_values(workspace)
     skipped: Counter[str] = Counter()
-    owned = _owned_events(outbox, skipped)
-    if not owned:
-        return CleanupReport(
-            deleted_count=0,
-            deleted_task_ids_hash=_report_hash(workspace_key, []),
-            skipped=MappingProxyType(dict(sorted(skipped.items()))),
-            candidate_count=0,
-            retained_count=0,
-            group_cleanup_skipped=0,
-        )
-
+    awaiting_ids = _awaiting_automation_ids(outbox)
     connection: sqlite3.Connection | None = None
     groups_available = False
     group_cleanup_skipped = 0
     deleted_ids: list[str] = []
+    deleted_candidates: list[_Candidate] = []
     candidate_count = 0
     retained_count = 0
     try:
@@ -278,165 +254,131 @@ def cleanup_history(
             rows = connection.execute(
                 """
                 SELECT
-                    t.workspace_key AS task_workspace_key,
-                    t.workspace_path AS task_workspace_path,
+                    t.workspace_key,
+                    t.workspace_path,
+                    t.workspace_identity,
                     t.task_id,
+                    t.title,
                     t.task_status,
-                    t.pinned,
-                    t.archived,
-                    t.title_overridden,
-                    t.created_at AS task_created_at,
-                    t.updated_at AS task_updated_at,
+                    t.created_at,
+                    t.updated_at,
                     t.cron_automation_id,
                     a.automation_id,
-                    a.title AS automation_title,
-                    a.workspace_key AS automation_workspace_key,
-                    a.workspace_path AS automation_workspace_path,
-                    a.target_task_id,
-                    a.recurring,
-                    a.max_runs,
-                    a.schedule_edited_by_user,
-                    a.enabled,
-                    a.lifecycle_status,
-                    a.next_run_at,
+                    a.title,
+                    a.workspace_path,
+                    a.workspace_identity,
                     a.running,
                     a.claimed_at,
                     a.dispatch_status
                 FROM tasks AS t
-                JOIN automations AS a
+                LEFT JOIN automations AS a
                   ON a.automation_id = t.cron_automation_id
                 WHERE t.deleted = 0
-                  AND t.workspace_key = ?
+                  AND t.cron_automation_id IS NOT NULL
+                  AND t.cron_automation_id <> ''
                   AND t.workspace_path = ?
-                  AND a.workspace_key = ?
-                  AND a.workspace_path = ?
+                  AND t.workspace_identity IS NULL
                 """,
-                (workspace_key, workspace_path, workspace_key, workspace_path),
+                (workspace_path,),
             ).fetchall()
         except sqlite3.Error as exc:
             raise HistoryCleanupError("历史清理查询失败") from exc
 
-        seen_automation_ids: set[str] = set()
-        candidates_by_source: dict[str, list[_Candidate]] = defaultdict(list)
+        candidates: list[_Candidate] = []
         for row in rows:
             (
                 task_workspace_key,
                 task_workspace_path,
+                task_workspace_identity,
                 task_id,
+                task_title,
                 task_status,
-                task_pinned,
-                task_archived,
-                task_title_overridden,
                 task_created_at,
                 task_updated_at,
-                task_cron_id,
-                automation_value,
-                automation_title,
-                automation_workspace_key,
-                automation_workspace_path,
-                target_task_id,
-                recurring,
-                max_runs,
-                schedule_edited_by_user,
-                enabled,
-                lifecycle_status,
-                next_run_at,
-                running,
-                claimed_at,
-                dispatch_status,
+                task_automation_id,
+                parent_automation_id,
+                parent_title,
+                parent_workspace_path,
+                parent_workspace_identity,
+                parent_running,
+                parent_claimed_at,
+                parent_dispatch_status,
             ) = row
-            owner = owned.get(automation_value)
-            if owner is None:
-                continue
-            seen_automation_ids.add(automation_value)
-            if (
-                task_workspace_key != workspace_key
-                or task_workspace_path != workspace_path
-                or automation_workspace_key != workspace_key
-                or automation_workspace_path != workspace_path
+            if not isinstance(task_workspace_key, str) or not isinstance(
+                task_workspace_path, str
             ):
                 _record_skip(skipped, "workspace")
                 continue
-            if task_id == owner.event_task_id:
-                _record_skip(skipped, "business_task_id")
+            if task_workspace_identity is not None:
+                _record_skip(skipped, "workspace_identity")
                 continue
-            if any(value != 0 for value in (task_pinned, task_archived, task_title_overridden)):
-                _record_skip(skipped, "task_user_protected")
+            if not isinstance(task_id, str) or not task_id:
+                _record_skip(skipped, "task_identity")
                 continue
-            if not isinstance(task_status, str) or task_status.casefold() not in _TERMINAL_STATUSES:
+            if not isinstance(task_automation_id, str) or not task_automation_id:
+                _record_skip(skipped, "automation_identity")
+                continue
+            if not isinstance(task_status, str) or task_status.casefold() not in _TERMINAL_TASK_STATUSES:
                 _record_skip(skipped, "task_status")
                 continue
-            if not _source_title_matches(owner.source, automation_title):
-                _record_skip(skipped, "automation_title_source")
+            if not _agent_tag_matches(task_title) and not _agent_tag_matches(
+                parent_title
+            ):
+                _record_skip(skipped, "agent_tag")
                 continue
-            if target_task_id is not None:
-                _record_skip(skipped, "automation_target_task")
+            if task_automation_id in awaiting_ids:
+                _record_skip(skipped, "event_waiting")
                 continue
-            if recurring != 0 or max_runs != 1:
-                _record_skip(skipped, "automation_schedule")
-                continue
-            if schedule_edited_by_user != 0:
-                _record_skip(skipped, "automation_schedule_edited")
-                continue
-            if running != 0:
-                _record_skip(skipped, "automation_running")
-                continue
-            if claimed_at is not None:
-                _record_skip(skipped, "automation_claimed")
-                continue
-            if lifecycle_status not in _TERMINAL_LIFECYCLES:
-                _record_skip(skipped, "automation_lifecycle")
-                continue
-            if enabled != 0 or next_run_at is not None:
-                _record_skip(skipped, "automation_enabled")
-                continue
-            if dispatch_status not in _TERMINAL_DISPATCHES:
-                _record_skip(skipped, "automation_dispatch")
-                continue
-            if not isinstance(task_created_at, int) or not isinstance(
-                task_updated_at, int
+            if parent_automation_id is not None:
+                if parent_workspace_identity is not None:
+                    _record_skip(skipped, "workspace_identity")
+                    continue
+                if parent_workspace_path != workspace_path:
+                    _record_skip(skipped, "workspace")
+                    continue
+                if _flag_enabled(parent_running) or _has_claim(parent_claimed_at):
+                    _record_skip(skipped, "automation_running")
+                    continue
+                if (
+                    isinstance(parent_dispatch_status, str)
+                    and parent_dispatch_status.casefold() in _ACTIVE_DISPATCH_STATUSES
+                ):
+                    _record_skip(skipped, "automation_running")
+                    continue
+            if not isinstance(task_created_at, int) or isinstance(
+                task_created_at, bool
+            ) or not isinstance(task_updated_at, int) or isinstance(
+                task_updated_at, bool
             ):
                 _record_skip(skipped, "task_timestamp")
                 continue
-            candidates_by_source[owner.source].append(
+            candidates.append(
                 _Candidate(
-                    source=owner.source,
-                    automation_id=owner.automation_id,
-                    event_task_id=owner.event_task_id,
-                    event_completed_at_ms=owner.completed_at_ms,
+                    automation_id=task_automation_id,
                     task_id=task_id,
                     task_created_at=task_created_at,
                     task_updated_at=task_updated_at,
+                    task_workspace_key=task_workspace_key,
+                    task_workspace_path=task_workspace_path,
                 )
             )
 
-        for automation_value in owned:
-            if automation_value not in seen_automation_ids:
-                _record_skip(skipped, "task_join_missing")
-
-        all_candidates = [
-            candidate
-            for source_candidates in candidates_by_source.values()
-            for candidate in source_candidates
-        ]
-        candidate_count = len(all_candidates)
-        to_delete: list[_Candidate] = []
-        for source_candidates in candidates_by_source.values():
-            ordered = sorted(
-                source_candidates,
-                key=lambda candidate: (
-                    candidate.event_completed_at_ms,
-                    candidate.task_updated_at,
-                    candidate.task_created_at,
-                    candidate.task_id,
-                ),
-                reverse=True,
-            )
-            retained_count += min(keep, len(ordered))
-            to_delete.extend(ordered[keep:])
+        candidate_count = len(candidates)
+        ordered = sorted(
+            candidates,
+            key=lambda candidate: (
+                candidate.task_updated_at,
+                candidate.task_created_at,
+                candidate.task_id,
+            ),
+            reverse=True,
+        )
+        retained_count = min(keep, len(ordered))
+        to_delete = ordered[keep:]
 
         if not groups_available and to_delete:
             _record_skip(skipped, "groups_missing")
+            group_cleanup_skipped = len(to_delete)
 
         if to_delete:
             if before_delete is None:
@@ -445,9 +387,7 @@ def cleanup_history(
                 )
             planned_report = CleanupReport(
                 deleted_count=len(to_delete),
-                deleted_task_ids_hash=_report_hash(
-                    workspace_key, [candidate.task_id for candidate in to_delete]
-                ),
+                deleted_task_ids_hash=_candidate_hash(to_delete),
                 skipped=MappingProxyType(dict(sorted(skipped.items()))),
                 candidate_count=candidate_count,
                 retained_count=retained_count,
@@ -464,25 +404,30 @@ def cleanup_history(
                 UPDATE tasks
                 SET deleted = 1
                 WHERE workspace_key = ?
+                  AND workspace_path = ?
                   AND task_id = ?
                   AND cron_automation_id = ?
                   AND deleted = 0
                 """,
-                (workspace_key, candidate.task_id, candidate.automation_id),
+                (
+                    candidate.task_workspace_key,
+                    candidate.task_workspace_path,
+                    candidate.task_id,
+                    candidate.automation_id,
+                ),
             ).rowcount
             if changed != 1:
-                _record_skip(skipped, "task_changed")
-                continue
+                raise HistoryCleanupError("历史清理事务中的任务行数不一致")
             deleted_ids.append(candidate.task_id)
+            deleted_candidates.append(candidate)
             if not groups_available:
-                group_cleanup_skipped += 1
                 continue
             connection.execute(
                 "DELETE FROM task_group_members WHERE workspace_key = ? AND task_id = ?",
-                (workspace_key, candidate.task_id),
+                (candidate.task_workspace_key, candidate.task_id),
             )
             task_node_key = json.dumps(
-                [workspace_key, candidate.task_id],
+                [candidate.task_workspace_key, candidate.task_id],
                 ensure_ascii=False,
                 separators=(",", ":"),
             )
@@ -499,7 +444,7 @@ def cleanup_history(
                 WHERE node_type = 'task' AND node_key = ?
                 LIMIT 1
                 """,
-                (workspace_key,),
+                (candidate.task_workspace_key,),
             ).fetchone()
             if legacy_exists is not None:
                 _record_skip(skipped, "legacy_task_node")
@@ -523,7 +468,7 @@ def cleanup_history(
 
     return CleanupReport(
         deleted_count=len(deleted_ids),
-        deleted_task_ids_hash=_report_hash(workspace_key, deleted_ids),
+        deleted_task_ids_hash=_candidate_hash(deleted_candidates),
         skipped=MappingProxyType(dict(sorted(skipped.items()))),
         candidate_count=candidate_count,
         retained_count=retained_count,

@@ -381,7 +381,7 @@ def _execute_once(
                 _save_state(store, state, errors)
             return RunReport(0, False, errors)
 
-        # 在正文过期前持久化最小归属；清理异常不能中断正常通知。
+        # 按自动化关联和来源标签整理历史；清理异常不能中断正常通知。
         try:
             cleanup = run_history_cleanup(
                 paths.tasks_db, state.outbox, paths.notification_workspace, state_path, now_ms
