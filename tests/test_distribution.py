@@ -607,8 +607,8 @@ def test_installer_pauses_owned_task_before_mutation_and_restores_running_state(
     install_body = installer[installer.index("function Invoke-Install"):]
     pause = install_body.index("Save-ExistingTaskXml")
     assert pause < install_body.index("Write-JsonAtomic")
-    assert pause < install_body.index("Move-Item -LiteralPath $appPath")
-    assert pause < install_body.index("Move-Item -LiteralPath $stageApp")
+    assert pause < install_body.index("Backup-ExistingAppPackage")
+    assert pause < install_body.index("Switch-StagedAppPackage")
     assert "Test-NotifierTaskActionBelongsToRoot" in installer
     assert "Start-ScheduledTask" in installer
     assert "Running = Get-TaskRunning" in installer
@@ -822,6 +822,9 @@ def test_installer_reports_only_a_fixed_failure_stage_and_exception_type():
         "preflight-codex",
         "filesystem-prepare",
         "task-backup",
+        "app-backup",
+        "config-backup",
+        "state-backup",
         "config-write",
         "app-stage",
         "state-migrate",

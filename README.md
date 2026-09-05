@@ -53,7 +53,7 @@
 
 ZCode 发现顺序为显式参数、`ZCODE_HOME`、用户目录下的 `.zcode`；当前版本不从运行中进程推断根目录，若这些候选均不可用请提供 `-ZCodeHome`。候选必须有任务索引和至少一个稳定目录标志，多个候选时停止并要求明确选择。通知工作区优先使用已确认 ZCode 根下的 `workspace/default`，不存在时回退到 `workspace`。Codex 发现顺序为显式参数、`CODEX_HOME`、用户目录下的 `.codex`，并要求 `sessions` 或稳定状态库结构。
 
-安装器将源程序放进本机产品目录，保留已有配置和状态，先在同一产品目录创建时间戳备份，再原子切换 `app`。它会执行 `baseline`，避免安装前历史事件洪泛；如果发现 ZCode 根下可验证的旧 `task-watch\snapshot.json`，只迁移已处理事件键。随后创建首个触发时间至少在一分钟后的当前用户、每分钟、隐藏运行的 `ZCodeTaskNotifier` 计划任务，运行 `doctor` 成功后才停用动作精确指向已验证旧监控脚本的旧任务；失败时旧 watcher 不会提前停用，也不按模糊名称处理其他任务。
+安装器将源程序放进本机产品目录，保留已有配置和状态，先在同一产品目录创建时间戳备份，再切换 `app/zcode_task_notifier` 程序包。`app` 根目录保持稳定，避免仅因目录共享句柄而无法整体移动；升级不会为此关闭其他应用。它会执行 `baseline`，避免安装前历史事件洪泛；如果发现 ZCode 根下可验证的旧 `task-watch\snapshot.json`，只迁移已处理事件键。随后创建首个触发时间至少在一分钟后的当前用户、每分钟、隐藏运行的 `ZCodeTaskNotifier` 计划任务，运行 `doctor` 成功后才停用动作精确指向已验证旧监控脚本的旧任务；失败时旧 watcher 不会提前停用，也不按模糊名称处理其他任务。
 
 计划任务使用已选 Python 安装内的 `pythonw.exe`，每分钟运行时不创建控制台黑框；安装、手动诊断仍使用 `python.exe` 显示结果。安装器会在改动任务前确认 `pythonw.exe` 存在。计划任务的 `Hidden` 只控制任务条目的显示，不负责隐藏进程窗口。
 
@@ -101,7 +101,7 @@ python -m zcode_task_notifier run --config <本机配置路径> --state <本机�
 
 ## 升级和卸载
 
-重复运行安装器会保留 `config.json`、`state.json` 和已有计划任务信息，先备份旧 `app`，失败时恢复备份和旧任务。默认安装目录执行 `scripts\uninstall.ps1 -KeepData` 只注销 `ZCodeTaskNotifier` 并删除本产品程序，保留本地状态和其他产品数据；如果安装时使用了自定义目录，卸载必须传入同一个目录，例如 `scripts\uninstall.ps1 -InstallDir $env:LOCALAPPDATA\ZCodeTaskNotifier -KeepData`。不带 `-KeepData` 时会先询问是否删除产品数据。卸载器会验证目标确实位于系统 LocalApplicationData 下且末级目录为产品名，不删除 ZCode 或 Codex 文件。
+重复运行安装器会保留 `config.json`、`state.json` 和已有计划任务信息，先备份旧程序包，失败时恢复备份和旧任务，不移动稳定的 `app` 根目录或删除其中的其他文件。配置和状态只有完成对应备份检查后才进入回滚范围；备份缺失时保留当前文件并明确报错，不假装已恢复。默认安装目录执行 `scripts\uninstall.ps1 -KeepData` 只注销 `ZCodeTaskNotifier` 并删除本产品程序，保留本地状态和其他产品数据；如果安装时使用了自定义目录，卸载必须传入同一个目录，例如 `scripts\uninstall.ps1 -InstallDir $env:LOCALAPPDATA\ZCodeTaskNotifier -KeepData`。不带 `-KeepData` 时会先询问是否删除产品数据。卸载器会验证目标确实位于系统 LocalApplicationData 下且末级目录为产品名，不删除 ZCode 或 Codex 文件。
 
 ## 隐私发布门禁和许可证
 

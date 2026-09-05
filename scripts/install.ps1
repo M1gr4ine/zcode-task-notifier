@@ -19,7 +19,8 @@ $script:InstallRoot = $null
 $script:StageRoot = $null
 $script:BackupRoot = $null
 $script:AppBackupPath = $null
-$script:AppSwitched = $false
+$script:AppPackageBackedUp = $false
+$script:AppPackageSwitched = $false
 $script:TaskRegistered = $false
 $script:RegisteredTaskPath = "\"
 $script:PreviousTask = $null
@@ -546,6 +547,78 @@ function Save-ExistingTaskXml {
     return $path
 }
 
+function Test-ProductPackageDirectory {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        throw "The application package is missing or not a directory"
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "The application package cannot be a reparse point"
+    }
+    foreach ($marker in @("__init__.py", "cli.py")) {
+        $markerPath = Join-Path $Path $marker
+        if (-not (Test-Path -LiteralPath $markerPath -PathType Leaf)) {
+            throw "The application package is not recognized"
+        }
+        $markerItem = Get-Item -LiteralPath $markerPath -Force -ErrorAction Stop
+        if (($markerItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The application package marker cannot be a reparse point"
+        }
+    }
+    return $true
+}
+
+function Backup-ExistingAppPackage {
+    param(
+        [Parameter(Mandatory = $true)][string]$AppPath,
+        [Parameter(Mandatory = $true)][string]$Directory
+    )
+
+    if (-not (Test-Path -LiteralPath $AppPath)) {
+        return
+    }
+    $appItem = Get-Item -LiteralPath $AppPath -Force -ErrorAction Stop
+    if (-not $appItem.PSIsContainer -or (($appItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+        throw "The existing application root is not a normal directory"
+    }
+    $packagePath = Join-Path $AppPath "zcode_task_notifier"
+    if (-not (Test-Path -LiteralPath $packagePath)) {
+        return
+    }
+    $null = Test-ProductPackageDirectory -Path $packagePath
+    $script:AppBackupPath = Join-Path $Directory "app\zcode_task_notifier"
+    New-Item -ItemType Directory -Path (Split-Path -Parent $script:AppBackupPath) -Force | Out-Null
+    Move-Item -LiteralPath $packagePath -Destination $script:AppBackupPath
+    $script:AppPackageBackedUp = $true
+}
+
+function Switch-StagedAppPackage {
+    param(
+        [Parameter(Mandatory = $true)][string]$StageAppPath,
+        [Parameter(Mandatory = $true)][string]$AppPath
+    )
+
+    $stagePackagePath = Join-Path $StageAppPath "zcode_task_notifier"
+    $null = Test-ProductPackageDirectory -Path $stagePackagePath
+    if (Test-Path -LiteralPath $AppPath) {
+        $appItem = Get-Item -LiteralPath $AppPath -Force -ErrorAction Stop
+        if (-not $appItem.PSIsContainer -or (($appItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
+            throw "The existing application root is not a normal directory"
+        }
+    }
+    else {
+        New-Item -ItemType Directory -Path $AppPath -Force | Out-Null
+    }
+    $targetPackagePath = Join-Path $AppPath "zcode_task_notifier"
+    if (Test-Path -LiteralPath $targetPackagePath) {
+        throw "The application package target is not empty"
+    }
+    Move-Item -LiteralPath $stagePackagePath -Destination $AppPath
+    $script:AppPackageSwitched = $true
+}
+
 function Get-ZCodeRoots {
     $result = New-Object System.Collections.Generic.HashSet[string]([StringComparer]::OrdinalIgnoreCase)
     $candidates = @()
@@ -889,18 +962,32 @@ function Restore-InstallFiles {
         return
     }
     $currentApp = Join-Path $script:InstallRoot "app"
-    $oldApp = $script:AppBackupPath
-    if ($null -eq $oldApp -and $null -ne $script:BackupRoot) {
-        $oldApp = Join-Path $script:BackupRoot "app"
-    }
-    if ($null -ne $oldApp -and (Test-Path -LiteralPath $oldApp -PathType Container)) {
-        if (Test-Path -LiteralPath $currentApp) {
-            Remove-Item -LiteralPath $currentApp -Recurse -Force
+    $currentPackage = Join-Path $currentApp "zcode_task_notifier"
+    if ($script:AppPackageBackedUp) {
+        if ([string]::IsNullOrWhiteSpace($script:AppBackupPath) -or
+            -not (Test-Path -LiteralPath $script:AppBackupPath -PathType Container)) {
+            throw "The previous application package backup is unavailable; the current package was preserved"
         }
-        Move-Item -LiteralPath $oldApp -Destination $currentApp -Force
+        $null = Test-ProductPackageDirectory -Path $script:AppBackupPath
     }
-    elseif ($script:AppSwitched -and (Test-Path -LiteralPath $currentApp)) {
-        Remove-Item -LiteralPath $currentApp -Recurse -Force
+    if ($script:AppPackageBackedUp -or $script:AppPackageSwitched) {
+        if (-not (Test-Path -LiteralPath $currentApp -PathType Container)) {
+            throw "The stable application root is unavailable before restore"
+        }
+        $currentAppItem = Get-Item -LiteralPath $currentApp -Force -ErrorAction Stop
+        if (($currentAppItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "The stable application root cannot be a reparse point"
+        }
+    }
+    if ($script:AppPackageSwitched -and (Test-Path -LiteralPath $currentPackage)) {
+        $null = Test-ProductPackageDirectory -Path $currentPackage
+        Remove-Item -LiteralPath $currentPackage -Recurse -Force
+    }
+    if ($script:AppPackageBackedUp) {
+        if (Test-Path -LiteralPath $currentPackage) {
+            throw "The current application package remains before restore"
+        }
+        Move-Item -LiteralPath $script:AppBackupPath -Destination $currentApp
     }
     if ($script:ConfigBackupReady) {
         Restore-FileBackup -Path (Join-Path $script:InstallRoot "config.json") -BackupPath $script:ConfigBackup -Existed $script:ConfigExisted
@@ -946,20 +1033,16 @@ function Invoke-Install {
     # 旧产品任务必须在首次改写配置、状态或应用前完成备份并暂停。
     $script:InstallStage = "task-backup"
     Save-ExistingTaskXml -Directory $script:BackupRoot -Root $script:InstallRoot | Out-Null
-    if (Test-Path -LiteralPath $appPath) {
-        $appItem = Get-Item -LiteralPath $appPath -Force
-        if (-not $appItem.PSIsContainer -or (($appItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0)) {
-            throw "The existing application path is not a normal directory"
-        }
-        $script:AppBackupPath = Join-Path $script:BackupRoot "app"
-        Move-Item -LiteralPath $appPath -Destination $script:AppBackupPath
-    }
+    $script:InstallStage = "app-backup"
+    Backup-ExistingAppPackage -AppPath $appPath -Directory $script:BackupRoot
+    $script:InstallStage = "config-backup"
     if (Test-Path -LiteralPath $configPath -PathType Leaf) {
         $script:ConfigExisted = $true
         $script:ConfigBackup = Join-Path $script:BackupRoot "config.json"
         Copy-Item -LiteralPath $configPath -Destination $script:ConfigBackup
     }
     $script:ConfigBackupReady = $true
+    $script:InstallStage = "state-backup"
     if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         $script:StateExisted = $true
         $script:StateBackup = Join-Path $script:BackupRoot "state.json"
@@ -984,11 +1067,7 @@ function Invoke-Install {
     Invoke-PythonModule -ModuleRoot $stageApp -Arguments @("-m", "zcode_task_notifier", "baseline", "--config", $configPath, "--state", $statePath, "--json")
 
     $script:InstallStage = "app-switch"
-    if (Test-Path -LiteralPath $appPath) {
-        throw "The old application is still present before the directory switch"
-    }
-    Move-Item -LiteralPath $stageApp -Destination $appPath
-    $script:AppSwitched = $true
+    Switch-StagedAppPackage -StageAppPath $stageApp -AppPath $appPath
     $script:InstallStage = "task-register"
     Register-NotifierTask -AppPath $appPath -ConfigPath $configPath -StatePath $statePath
     $script:InstallStage = "doctor"
