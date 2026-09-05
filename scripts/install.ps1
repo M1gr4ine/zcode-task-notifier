@@ -14,6 +14,7 @@ $script:TaskName = "ZCodeTaskNotifier"
 $script:ProductName = "ZCodeTaskNotifier"
 $script:SourceRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $script:Python = $null
+$script:WindowlessPython = $null
 $script:InstallRoot = $null
 $script:StageRoot = $null
 $script:BackupRoot = $null
@@ -85,6 +86,25 @@ function Find-Python {
         }
     }
     throw "No usable Python interpreter was found"
+}
+
+function Find-WindowlessPython {
+    param([Parameter(Mandatory = $true)][string]$ConsolePython)
+
+    # 使用已选解释器报告的真实位置，兼容 py 启动器与虚拟环境。
+    $runtimePaths = @(& $ConsolePython -c "import sys; print(sys.executable)" 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $runtimePaths.Count -ne 1) {
+        throw "windowless-python-discovery-failed"
+    }
+    $runtimePath = ([string]$runtimePaths[0]).Trim()
+    if (-not [IO.Path]::IsPathRooted($runtimePath) -or -not (Test-Path -LiteralPath $runtimePath -PathType Leaf)) {
+        throw "windowless-python-runtime-invalid"
+    }
+    $windowless = Join-Path (Split-Path -Parent $runtimePath) "pythonw.exe"
+    if (-not (Test-Path -LiteralPath $windowless -PathType Leaf)) {
+        throw "windowless-python-unavailable"
+    }
+    return (Resolve-Path -LiteralPath $windowless).Path
 }
 
 function Invoke-PythonModule {
@@ -305,7 +325,10 @@ function New-NotifierTaskAction {
     param([string]$AppPath, [string]$ConfigPath, [string]$StatePath)
 
     $arguments = "-m zcode_task_notifier run --config " + (Quote-TaskArgument $ConfigPath) + " --state " + (Quote-TaskArgument $StatePath)
-    return New-ScheduledTaskAction -Execute $script:Python -Argument $arguments -WorkingDirectory $AppPath
+    if ([string]::IsNullOrWhiteSpace($script:WindowlessPython)) {
+        throw "windowless-python-not-selected"
+    }
+    return New-ScheduledTaskAction -Execute $script:WindowlessPython -Argument $arguments -WorkingDirectory $AppPath
 }
 
 function Get-ExistingTask {
@@ -842,6 +865,7 @@ function Invoke-Install {
         throw "The source package is incomplete"
     }
     $script:Python = Find-Python
+    $script:WindowlessPython = Find-WindowlessPython -ConsolePython $script:Python
     $script:InstallStage = "preflight-weixin"
     Confirm-Weixin
     $script:InstallStage = "preflight-codex"
