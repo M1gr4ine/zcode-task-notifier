@@ -123,13 +123,56 @@ function Invoke-PythonModule {
     }
     try {
         if ($Capture) {
-            $output = (& $script:Python @Arguments 2>$null | Out-String)
-            $code = $LASTEXITCODE
-            return [pscustomobject]@{ Output = $output; ExitCode = $code }
+            $stdoutPath = Join-Path ([IO.Path]::GetTempPath()) ("zcode-task-notifier-stdout-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+            $stderrPath = Join-Path ([IO.Path]::GetTempPath()) ("zcode-task-notifier-stderr-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+            $oldErrorActionPreference = $ErrorActionPreference
+            try {
+                # 原生命令的 stderr 可能只是 doctor 警告；先分离保存，避免 PowerShell 将其升级为 RemoteException。
+                $ErrorActionPreference = "Continue"
+                $global:LASTEXITCODE = $null
+                try {
+                    & $script:Python @Arguments 1> $stdoutPath 2> $stderrPath
+                }
+                catch {
+                    throw "The Python command could not be started"
+                }
+                $code = $LASTEXITCODE
+                if ($null -eq $code) {
+                    throw "The Python command could not be started"
+                }
+                $output = if (Test-Path -LiteralPath $stdoutPath) { [IO.File]::ReadAllText($stdoutPath) } else { "" }
+                $errorOutput = if (Test-Path -LiteralPath $stderrPath) { [IO.File]::ReadAllText($stderrPath) } else { "" }
+                return [pscustomobject]@{ Output = $output; ErrorOutput = $errorOutput; ExitCode = $code }
+            }
+            finally {
+                $ErrorActionPreference = $oldErrorActionPreference
+                Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
+                Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
+            }
         }
-        & $script:Python @Arguments 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            throw "The Python command returned a non-zero status"
+        $stderrPath = Join-Path ([IO.Path]::GetTempPath()) ("zcode-task-notifier-stderr-" + [Guid]::NewGuid().ToString("N") + ".tmp")
+        $oldErrorActionPreference = $ErrorActionPreference
+        try {
+            # 非 Capture 调用仍保留 stdout；stderr 单独接收，成功警告不应中止安装。
+            $ErrorActionPreference = "Continue"
+            $global:LASTEXITCODE = $null
+            try {
+                & $script:Python @Arguments 2> $stderrPath
+            }
+            catch {
+                throw "The Python command could not be started"
+            }
+            $code = $LASTEXITCODE
+            if ($null -eq $code) {
+                throw "The Python command could not be started"
+            }
+            if ($code -ne 0) {
+                throw "The Python command returned a non-zero status"
+            }
+        }
+        finally {
+            $ErrorActionPreference = $oldErrorActionPreference
+            Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
         }
     }
     finally {
