@@ -44,7 +44,7 @@ def _run_pythonw(
     config_path: Path,
     state_path: Path,
     command: str,
-) -> subprocess.CompletedProcess[str]:
+) -> subprocess.CompletedProcess[bytes]:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(_repo_root() / "src")
     environment["PYTHONNOUSERSITE"] = "1"
@@ -63,11 +63,12 @@ def _run_pythonw(
         cwd=root,
         env=environment,
         capture_output=True,
-        text=True,
+        text=False,
         timeout=30,
     )
 
 
+@pytest.mark.filterwarnings("error::pytest.PytestUnhandledThreadExceptionWarning")
 def test_pythonw_completes_baseline_and_run_without_console(tmp_path: Path):
     executable = _pythonw()
     _assert_gui_subsystem(executable)

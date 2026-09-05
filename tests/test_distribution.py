@@ -277,29 +277,51 @@ def _commit_fixture(root: Path, message: str) -> None:
     )
 
 
-def _run_privacy_fixture(root: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+def _decode_powershell_output(value: bytes) -> str:
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        # 重定向时 Windows PowerShell 5.1 遵循活动 ANSI 代码页。
+        return value.decode("mbcs", errors="replace")
+
+
+def _run_privacy_fixture(
+    root: Path, *arguments: str, console_code_page: int | None = None
+) -> subprocess.CompletedProcess[str]:
     executable = _powershell_executable()
     if executable is None:
         if os.name == "nt":
             pytest.fail("PowerShell is required on Windows")
         pytest.skip("PowerShell unavailable on non-Windows")
-    return subprocess.run(
-        [
-            executable,
-            "-NoLogo",
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(root / "scripts/privacy-check.ps1"),
-            *arguments,
-        ],
+    command = [
+        executable,
+        "-NoLogo",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        str(root / "scripts/privacy-check.ps1"),
+        *arguments,
+    ]
+    if console_code_page is not None:
+        command = [
+            "cmd.exe",
+            "/d",
+            "/c",
+            f"chcp {console_code_page} >NUL && {subprocess.list2cmdline(command)}",
+        ]
+    completed = subprocess.run(
+        command,
         cwd=root,
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        text=False,
         timeout=90,
+    )
+    return subprocess.CompletedProcess(
+        completed.args,
+        completed.returncode,
+        _decode_powershell_output(completed.stdout),
+        _decode_powershell_output(completed.stderr),
     )
 
 
@@ -437,6 +459,31 @@ def test_privacy_powershell_51_handles_realistic_public_file_count(
     assert result.stdout.strip() == expected
     assert result.stderr == ""
     assert str(root) not in result.stdout + result.stderr
+
+
+def test_privacy_history_handles_utf8_console_code_page(tmp_path: Path):
+    powershell = shutil.which("powershell.exe")
+    if powershell is None:
+        if os.name == "nt":
+            pytest.fail("Windows PowerShell 5.1 is required on Windows")
+        pytest.skip("Windows PowerShell 5.1 unavailable on non-Windows")
+
+    root = tmp_path / "privacy-ps51-utf8-history"
+    root.mkdir()
+    _init_privacy_fixture(root)
+    for source in tracked_candidate_files(repo_root()):
+        relative = source.relative_to(repo_root())
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if relative != Path("scripts/privacy-check.ps1"):
+            target.write_bytes(source.read_bytes())
+    _commit_fixture(root, "synthetic public snapshot")
+
+    result = _run_privacy_fixture(root, "-History", console_code_page=65001)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "工作树与 Git 历史隐私检查通过"
+    assert result.stderr == ""
 
 
 def test_privacy_unc_requires_server_and_share_components(tmp_path: Path):

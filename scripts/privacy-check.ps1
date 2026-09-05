@@ -203,7 +203,7 @@ function Get-IgnoredRuntimeFiles {
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
     try {
-        [void]$process.Start()
+        Start-GitProcess -Process $process -StartInfo $startInfo
         $stream = $process.StandardOutput.BaseStream
         while ($true) {
             $relative = Read-NullDelimitedRecord -Stream $stream
@@ -247,7 +247,7 @@ function Get-WorkingTreeFiles {
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
     try {
-        [void]$process.Start()
+        Start-GitProcess -Process $process -StartInfo $startInfo
         $stream = $process.StandardOutput.BaseStream
         while ($true) {
             $relative = Read-NullDelimitedRecord -Stream $stream
@@ -319,6 +319,23 @@ function New-GitProcessStartInfo {
     return $startInfo
 }
 
+function Start-GitProcess {
+    param(
+        [Parameter(Mandatory = $true)][Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][Diagnostics.ProcessStartInfo]$StartInfo
+    )
+    $previousInputEncoding = [Console]::InputEncoding
+    try {
+        # PS5.1 会按控制台代码页创建标准输入；临时指定无 BOM UTF-8，避免污染 Git 请求。
+        [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
+        $Process.StartInfo = $StartInfo
+        [void]$Process.Start()
+    }
+    finally {
+        [Console]::InputEncoding = $previousInputEncoding
+    }
+}
+
 function Read-StreamLine {
     param(
         [Parameter(Mandatory = $true)][IO.Stream]$Stream,
@@ -371,7 +388,7 @@ function Get-HistoryObjectMetadata {
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
     try {
-        [void]$process.Start()
+        Start-GitProcess -Process $process -StartInfo $startInfo
         $process.StandardInput.WriteLine($ObjectId)
         $process.StandardInput.Close()
         # --batch-check 只返回一行 type/size 元数据，不能读取原始 blob 正文。
@@ -439,7 +456,7 @@ function Get-HistoryBlobText {
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $startInfo
     try {
-        [void]$process.Start()
+        Start-GitProcess -Process $process -StartInfo $startInfo
         $process.StandardInput.WriteLine($ObjectId)
         $process.StandardInput.Close()
         $stream = $process.StandardOutput.BaseStream
@@ -512,7 +529,7 @@ function Scan-GitHistory {
     $process.StartInfo = $startInfo
     $seen = New-Object System.Collections.Generic.HashSet[string]
     try {
-        [void]$process.Start()
+        Start-GitProcess -Process $process -StartInfo $startInfo
         $reader = $process.StandardOutput
         while (($line = $reader.ReadLine()) -ne $null) {
             if ([string]::IsNullOrWhiteSpace([string]$line)) {
