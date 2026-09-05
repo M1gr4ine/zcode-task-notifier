@@ -1,6 +1,8 @@
-# ZCode / Codex 任务完成微信通知器
+# ZCode / Codex 任务停顿微信通知器
 
 公开仓库：<https://github.com/M1gr4ine/zcode-task-notifier>
+
+当前代码版本 `0.2.0`：实际停顿分类、来源标签与安全通知历史整理已交付；路线图中的 `/刷新` 和微信远程计划审批仍未实现，具体限制见下文。第一版发布标签不被覆盖。
 
 把下面这段话复制给 ZCode Agent：
 
