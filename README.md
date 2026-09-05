@@ -80,6 +80,8 @@ ZCode 优先使用当前 `model_io` 的回复与结束原因，避免把中间�
 
 `/刷新` token 和微信“同意”批准桌面会话计划尚未实现：原版未确认可供本产品安全接入的入站控制和桌面审批接口。原版 `/status` 不等于 token 刷新，`/approve` 是权限审批而非计划审批；不要据此向普通聊天发送控制词期待本产品启动任务。调查结论及后续门槛见 [原生能力边界](docs/native-control-capabilities.md) 和 [第三版计划](docs/superpowers/plans/2026-09-05-v3-wechat-plan-approval.md)。
 
+允许修改用户 ClawBot 配置后的复核见 [微信刷新指令可行性](docs/wechat-refresh-feasibility.md)：当前配置入口仍不足以闭环，独立单消费者网关与受控适配器尚需验证，未部署到现有机器人。
+
 安装完成后可运行：
 
 ```powershell
