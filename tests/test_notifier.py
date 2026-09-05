@@ -154,16 +154,44 @@ def test_zcode_prompt_does_not_add_codex_prefix():
 
 def test_same_event_gets_same_initial_automation_id(tmp_path: Path):
     db = make_automations_db(tmp_path / "tasks.sqlite")
+    first_target = fake_bot_target()
+    second_target = {**fake_bot_target(), "providerUserId": "wx-user-second"}
     first = enqueue_automation(
-        db, tmp_path / "workspace-one", fake_bot_target(), fake_event(), "model", 5000
+        db, tmp_path / "workspace-one", first_target, fake_event(), "model", 5000
     )
     second = enqueue_automation(
-        db, tmp_path / "workspace-one", fake_bot_target(), fake_event(), "model", 9000
+        db, tmp_path / "workspace-one", second_target, fake_event(), "model", 9000
     )
 
     assert first == second
     assert first == automation_id(fake_event().key)
     assert count_automations(db) == 1
+    row = read_automation(db)
+    assert json.loads(row["bot_delivery_target"]) == first_target
+    assert row["next_run_at"] == 5000
+
+
+def test_native_lookup_uses_full_workspace_path_and_persisted_target(tmp_path: Path):
+    db = make_automations_db(tmp_path / "tasks.sqlite")
+    workspace = tmp_path / "workspace with spaces"
+    target = fake_bot_target()
+
+    identifier = enqueue_automation(
+        db, workspace, target, fake_event(), "model", 5000
+    )
+
+    connection = sqlite3.connect(db)
+    try:
+        row = connection.execute(
+            "SELECT bot_delivery_target FROM automations "
+            "WHERE automation_id = ? AND workspace_key = ?",
+            (identifier, str(workspace)),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    assert row is not None
+    assert json.loads(row[0]) == target
 
 
 def test_public_automation_id_defaults_to_initial_delivery():
@@ -186,16 +214,17 @@ def test_enqueue_uses_parameterized_dynamic_payload_and_stores_no_secret_log(
     enqueue_automation(db, workspace, target, event, "glm-synthetic", 123456)
 
     row = read_automation(db)
-    assert row["workspace_key"] == workspace.name
+    assert row["workspace_key"] == str(workspace)
     assert row["workspace_path"] == str(workspace)
     assert row["model"] == "glm-synthetic"
     assert row["cron_expr"] == "* * * * *"
+    # provider 是模型提供商字段，不能被微信路由 provider 覆盖。
     assert row["provider"] is None
     assert row["mode"] == "yolo"
     assert row["thought_level"] is None
     assert row["workspace_identity"] is None
     assert row["target_task_id"] is None
-    assert row["bot_delivery_target"] is None
+    assert json.loads(row["bot_delivery_target"]) == target
     assert row["location_kind"] == "local"
     assert row["recurring"] == 0
     assert row["max_runs"] == 1
@@ -357,6 +386,15 @@ def test_unknown_not_null_column_with_default_is_accepted(tmp_path: Path):
 def test_target_boundary_rejects_credentials_and_unknown_keys(tmp_path: Path):
     db = make_automations_db(tmp_path / "tasks.sqlite")
     target = {**fake_bot_target(), "credentialRef": "credential-example"}
+
+    with pytest.raises(ValueError, match="bot_target"):
+        enqueue_automation(db, tmp_path / "workspace", target, fake_event(), "model", 1)
+
+
+def test_target_boundary_rejects_missing_fields(tmp_path: Path):
+    db = make_automations_db(tmp_path / "tasks.sqlite")
+    target = fake_bot_target()
+    target.pop("chatType")
 
     with pytest.raises(ValueError, match="bot_target"):
         enqueue_automation(db, tmp_path / "workspace", target, fake_event(), "model", 1)

@@ -565,7 +565,7 @@ def test_same_event_gets_same_initial_automation_id(tmp_path: Path):
     assert count_automations(db) == 1
 ```
 
-再覆盖真实 v2 `automations` 33 列 schema 失败关闭、参数化存储、Codex 标题字段带前缀、ZCode 不带前缀、bot target 未写入自动化。真实契约为 `automation_id`、`title`、`cron_expr`、`prompt`、`model`、`provider`、`mode`、`thought_level`、`workspace_key`、`workspace_path`、`workspace_identity`、`target_task_id`、`bot_delivery_target`、`location_kind`、`recurring`、`max_runs`、`end_at`、`schedule_rule`、`schedule_edited_by_user`、`run_count`、`scheduled_run_count`、`enabled`、`lifecycle_status`、`next_run_at`、`last_run_at`、`running`、`claimed_at`、`dispatch_status`、`dispatch_attempts`、`retry_at`、`last_error`、`created_at`、`updated_at`；旧虚构事件列不再作为要求。
+再覆盖真实 v2 `automations` 33 列 schema 失败关闭和参数化存储。2026-09-05 修正验收：ZCode、Codex 均带来源标签；本地工作区使用完整路径 key；bot target 写入四字段路由 JSON，不包含凭据/token。字段清单以 `notifier._AUTOMATION_COLUMNS` 为准，旧虚构事件列不再作为要求。
 
 - [ ] **Step 2: 运行通知器测试并确认失败**
 
@@ -581,7 +581,7 @@ def automation_id(event_key: str) -> str:
     return f"automation-tnotify-{digest}"
 ```
 
-`enqueue_automation` 先用 `PRAGMA table_info(automations)` 验证真实 33 列集合、类型、必填 NOT NULL、`automation_id` 唯一/主键及未知 NOT NULL 默认值，再在单事务中仅按确定性首发 `automation_id` 查询幂等后 `INSERT`。`bot_delivery_target` 按本机契约写入 NULL，不序列化机器人目标；`workspace_key` 与 `workspace_path` 使用动态发现结果；`next_run_at` 使用 `due_at_ms`；模型固定取配置，`cron_expr` 固定为 `* * * * *`，`mode` 为 `yolo`，一次性任务状态按旧 watcher 已验证值写入。提示词直接包含已截断的 `summary_text`，并使用边界标识将其声明为不可信数据。
+`enqueue_automation` 先用 `PRAGMA table_info(automations)` 验证真实列集合、类型、必填 NOT NULL、`automation_id` 唯一/主键及未知 NOT NULL 默认值，再在单事务中按确定性首发 `automation_id` 查询幂等后 `INSERT`。2026-09-05 纠正原 NULL 假设：`bot_delivery_target` 必须序列化动态发现的路由目标；本地 `workspace_key` 与 `workspace_path` 都使用完整工作区路径。已有首发行只返回，不重新调度或重发。`next_run_at` 使用 `due_at_ms`，模型取配置，`cron_expr` 为 `* * * * *`，`mode` 为 `yolo`。提示词包含已截断的 `summary_text`，使用边界标识声明为不可信数据。
 
 - [ ] **Step 4: 写失败不触发后续自动化测试**
 

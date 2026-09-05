@@ -181,7 +181,7 @@ codex:<thread-id>:<turn-id>:<final-message-hash>
 真实 33 列契约校验 `automation_id` 的 TEXT 类型及唯一/主键约束、必填列类型与 NOT NULL，
 未知 NOT NULL 且无默认值的列直接失败关闭。自动化行只使用 `title` 和 `prompt` 承载事件详情，
 `automation_id` 由事件键按首发哈希规则确定性编码并仅按自身查询幂等；来源元数据留在本机 state/outbox。
-`bot_delivery_target` 按本机已验证契约保持 NULL，不把机器人标识或凭据写入自动化行。
+2026-09-05 修正：`bot_delivery_target` 必须保存动态发现的四字段路由 JSON（provider、botId、providerUserId、chatType），不保存凭据或 token；原先要求 NULL 的假设导致微信订阅未建立。本地工作区 key 为完整路径，不能用目录名。参见 `docs/native-control-capabilities.md`。
 
 提示词要求 GLM：
 

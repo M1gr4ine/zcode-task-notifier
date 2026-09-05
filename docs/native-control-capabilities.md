@@ -50,6 +50,14 @@ Web Remote Control 使用配对后的设备标识、鉴权材料、HMAC 和 `rpc
 
 ## 通知历史与自动化定义不能混同
 
+### 原生投递绑定核验修正
+
+`dispatchCronRun` 根据工作区路径计算原生 key，调用 `watchCronRunBotDelivery`，后者通过 `AutomationRepo.getBotDeliveryTarget(automationId, workspaceKey)` 精确查询自动化。只有目标存在才调用 `botsService.watchAutomationRun`；查询返回空时不会订阅，也不一定留下发送失败日志。
+
+无 workspaceIdentity 的本地工作区使用完整路径作为 key。把 key 写成末级目录名会造成任务已经执行、投递查询却返回空；把 `bot_delivery_target` 留空也会阻断订阅。旧设计中“NULL 是已验证契约”的结论有误，已纠正：新建自动化写入动态发现的四字段路由 JSON，不写入凭据或 token，不重放旧任务。
+
+微信路由配置正确、原生摘要成功、iLink 接受发送、用户手机实际收到是不同验证层次；前两项不能代替后两项。
+
 - `tasks.cron_automation_id` 关联 `automations.automation_id`；任务查询支持按自动化归属且过滤 `deleted=0`。
 - `TaskIndex.updateTaskState` 的软删除会设置任务的 `deleted` 并清理任务组引用，不删除会话文件。
 - `AutomationRepo.delete` 是自动化定义硬删除，并不负责同时删除 `automation_runs`，不适合用来实现侧边栏通知历史整理。

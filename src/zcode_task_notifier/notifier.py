@@ -340,11 +340,13 @@ def _validate_automations_schema(connection: sqlite3.Connection) -> None:
 def _workspace_values(workspace: Path) -> tuple[str, str]:
     path = Path(workspace)
     path_text = str(path)
-    key = path.name or path_text or "workspace"
+    # 原生 scheduler 在没有 identity 时直接回退到完整路径。
+    # 目录名只适合展示，不能用于原生按 workspace_key 查询自动化。
+    key = path_text or "workspace"
     return key, path_text
 
 
-def _validate_bot_target(bot_target: Mapping[str, str]) -> None:
+def _validate_bot_target(bot_target: Mapping[str, str]) -> dict[str, str]:
     if not isinstance(bot_target, Mapping):
         raise TypeError("bot_target 必须是映射")
     target = dict(bot_target)
@@ -359,6 +361,7 @@ def _validate_bot_target(bot_target: Mapping[str, str]) -> None:
             raise ValueError("bot_target 字段必须是非空字符串")
         if "enc:v1:" in value.casefold():
             raise ValueError("bot_target 不得包含凭据值")
+    return target
 
 
 def _now_ms() -> int:
@@ -391,11 +394,12 @@ def enqueue_automation(
 ) -> str:
     """幂等地把一个完成事件写入 ZCode 自动化表并返回其首发 ID。"""
     _validate_inputs(db_path, event, model, due_at_ms)
-    _validate_bot_target(bot_target)
+    target = _validate_bot_target(bot_target)
     identifier = automation_id(event.key)
     workspace_key, workspace_path = _workspace_values(workspace)
     title = _display_title(event)
     prompt = build_prompt(event)
+    target_json = json.dumps(target, ensure_ascii=False, separators=(",", ":"))
     now_ms = _now_ms()
 
     connection: sqlite3.Connection | None = None
@@ -439,7 +443,7 @@ def enqueue_automation(
                 workspace_path,
                 None,
                 None,
-                None,
+                target_json,
                 "local",
                 0,
                 1,

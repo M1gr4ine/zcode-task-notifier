@@ -4,7 +4,7 @@ from .config import AppConfig, ConfigError, load_config, save_config
 from .models import DiscoveredPaths, Event, OutboxItem, RuntimeState
 from .state import ProcessLock, StateError, StateStore
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 __all__ = [
     "AppConfig",

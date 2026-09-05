@@ -285,9 +285,12 @@ def test_v2_bot_bundle_reaches_native_automation_schema_without_bot_secret(
     assert rows[0][1] == "[zcode] 合成 ZCode 任务"
     assert rows[1][1] == "[codex] 合成 Codex 任务"
     assert all("不可信事件 JSON" in row[2] for row in rows)
-    assert all(row[3] == "workspace-example" for row in rows)
+    assert all(row[3] == str(fixture.zcode_home / "workspace-example") for row in rows)
     assert all(row[4].endswith("workspace-example") for row in rows)
-    assert all(row[5] is None for row in rows)
+    assert all(json.loads(row[5]) == {
+        "provider": "weixin", "botId": "bot-example-0001",
+        "providerUserId": "wx-user-example", "chatType": "private",
+    } for row in rows)
     assert all(row[6:] == ("local", 0, "active") for row in rows)
 
 
