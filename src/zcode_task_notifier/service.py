@@ -23,6 +23,7 @@ from .codex_source import (
     scan_codex_events,
 )
 from .config import AppConfig, ConfigError, load_config
+from .cleanup_service import run_history_cleanup
 from .discovery import DiscoveryError, discover_paths, load_weixin_target, redact_path
 from .models import Event, OutboxItem, RuntimeState
 from .notifier import (
@@ -40,6 +41,8 @@ class RunReport:
     enqueued: int
     skipped_locked: bool
     source_errors: list[str]
+    cleanup_deleted: int = 0
+    cleanup_warnings: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -334,6 +337,8 @@ def _execute_once(
     lock = ProcessLock(_lock_path(state_path))
     if not lock.acquire():
         return _empty_report(skipped_locked=True)
+    cleanup_deleted = 0
+    cleanup_warnings: list[str] = []
     try:
         loaded = _load_config_and_state(config_path, state_path)
         if isinstance(loaded, RunReport):
@@ -376,19 +381,28 @@ def _execute_once(
                 _save_state(store, state, errors)
             return RunReport(0, False, errors)
 
+        # 在正文过期前持久化最小归属；清理异常不能中断正常通知。
+        try:
+            cleanup = run_history_cleanup(
+                paths.tasks_db, state.outbox, paths.notification_workspace, state_path, now_ms
+            )
+            cleanup_deleted = cleanup.deleted_count
+        except Exception as exc:
+            cleanup_warnings.append(_error("history_cleanup", exc))
+
         dirty = _prune_outbox(state, config, now_ms)
 
         # 已有 pending 项可以在扫描新来源前投递，避免来源读取延迟阻塞
         # 首发状态保存失败后的幂等恢复。
         if dirty:
             if not _save_state(store, state, errors):
-                return RunReport(0, False, errors)
+                return RunReport(0, False, errors, cleanup_deleted, cleanup_warnings)
         # 完成/失败首发仍可先恢复；等待类必须先读取本轮恢复信号。
         enqueued, persisted = _submit_due_items(
             paths, state, config, store, now_ms, errors, waiting_sources=set()
         )
         if not persisted:
-            return RunReport(enqueued, False, errors)
+            return RunReport(enqueued, False, errors, cleanup_deleted, cleanup_warnings)
 
         events, source_dirty, source_errors, refreshed_sources = _scan_sources(
             paths,
@@ -415,18 +429,18 @@ def _execute_once(
             if not _save_state(store, state, errors):
                 # 新事件尚未可靠落盘时，不能先写入 ZCode
                 # 自动化；否则外部写入成功后状态丢失会造成不可恢复的重复。
-                return RunReport(enqueued, False, errors)
+                return RunReport(enqueued, False, errors, cleanup_deleted, cleanup_warnings)
 
         submitted, persisted = _submit_due_items(
             paths, state, config, store, now_ms, errors, waiting_sources=refreshed_sources
         )
         enqueued += submitted
         if not persisted:
-            return RunReport(enqueued, False, errors)
-        return RunReport(enqueued, False, errors)
+            return RunReport(enqueued, False, errors, cleanup_deleted, cleanup_warnings)
+        return RunReport(enqueued, False, errors, cleanup_deleted, cleanup_warnings)
     except Exception as exc:
         # 锁释放仍在 finally 执行；对意外错误只返回脱敏摘要。
-        return _empty_report(errors=[_source_error("service", exc)])
+        return RunReport(0, False, [_source_error("service", exc)], cleanup_deleted, cleanup_warnings)
     finally:
         lock.release()
 

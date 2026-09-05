@@ -81,6 +81,10 @@ def _print_run(
         print(f"已入队 {report.enqueued}")
     for error in report.source_errors:
         print(f"错误：{error}")
+    if report.cleanup_deleted:
+        print(f"已软删除通知历史 {report.cleanup_deleted} 条，会话文件保留")
+    for warning in report.cleanup_warnings:
+        print(f"清理警告：{warning}")
 
 
 def _print_doctor(report: DoctorReport, as_json: bool) -> None:
