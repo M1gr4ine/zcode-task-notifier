@@ -28,6 +28,8 @@ $script:ConfigBackup = $null
 $script:StateBackup = $null
 $script:ConfigExisted = $false
 $script:StateExisted = $false
+$script:ConfigBackupReady = $false
+$script:StateBackupReady = $false
 $script:LegacyTaskRecords = @()
 $script:LegacyTaskWarnings = @()
 $script:NotifierTriggerAt = $null
@@ -868,8 +870,11 @@ function Restore-PreviousTask {
 
 function Restore-FileBackup {
     param([string]$Path, [string]$BackupPath, [bool]$Existed)
-    if ($null -ne $BackupPath -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
+    if (-not [string]::IsNullOrWhiteSpace($BackupPath) -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
         Copy-Item -LiteralPath $BackupPath -Destination $Path -Force
+    }
+    elseif ($Existed) {
+        throw "The previous file backup is unavailable; the current file was preserved"
     }
     elseif (-not $Existed -and (Test-Path -LiteralPath $Path)) {
         if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
@@ -897,8 +902,12 @@ function Restore-InstallFiles {
     elseif ($script:AppSwitched -and (Test-Path -LiteralPath $currentApp)) {
         Remove-Item -LiteralPath $currentApp -Recurse -Force
     }
-    Restore-FileBackup -Path (Join-Path $script:InstallRoot "config.json") -BackupPath $script:ConfigBackup -Existed $script:ConfigExisted
-    Restore-FileBackup -Path (Join-Path $script:InstallRoot "state.json") -BackupPath $script:StateBackup -Existed $script:StateExisted
+    if ($script:ConfigBackupReady) {
+        Restore-FileBackup -Path (Join-Path $script:InstallRoot "config.json") -BackupPath $script:ConfigBackup -Existed $script:ConfigExisted
+    }
+    if ($script:StateBackupReady) {
+        Restore-FileBackup -Path (Join-Path $script:InstallRoot "state.json") -BackupPath $script:StateBackup -Existed $script:StateExisted
+    }
 }
 
 function Invoke-Install {
@@ -950,11 +959,13 @@ function Invoke-Install {
         $script:ConfigBackup = Join-Path $script:BackupRoot "config.json"
         Copy-Item -LiteralPath $configPath -Destination $script:ConfigBackup
     }
+    $script:ConfigBackupReady = $true
     if (Test-Path -LiteralPath $statePath -PathType Leaf) {
         $script:StateExisted = $true
         $script:StateBackup = Join-Path $script:BackupRoot "state.json"
         Copy-Item -LiteralPath $statePath -Destination $script:StateBackup
     }
+    $script:StateBackupReady = $true
     $script:InstallStage = "config-write"
     $config = Read-OrCreateConfig -Path $configPath -CodexEnabled $codexEnabled
     Write-JsonAtomic -Path $configPath -Value $config
