@@ -112,7 +112,7 @@ def test_pythonw_completes_baseline_and_run_without_console(tmp_path: Path):
         ).fetchall()
     finally:
         connection.close()
-    assert rows == [("合成 ZCode 任务", "workspace-example", "local", 0, "active")]
+    assert rows == [("[zcode] 合成 ZCode 任务", "workspace-example", "local", 0, "active")]
 
 
 def _run_powershell_harness(

@@ -251,7 +251,7 @@ def test_baseline_is_silent_then_zcode_and_codex_complete_once(tmp_path: Path):
 
     assert report.enqueued == 2
     assert fixture.automation_titles() == [
-        "合成 ZCode 任务",
+        "[zcode] 合成 ZCode 任务",
         "[codex] 合成 Codex 任务",
     ]
     assert run_once(fixture.config_path, fixture.state_path, now_ms=160000).enqueued == 0
@@ -282,7 +282,7 @@ def test_v2_bot_bundle_reaches_native_automation_schema_without_bot_secret(
         connection.close()
     assert len(rows) == 2
     assert all(row[0].startswith("automation-tnotify-") for row in rows)
-    assert rows[0][1] == "合成 ZCode 任务"
+    assert rows[0][1] == "[zcode] 合成 ZCode 任务"
     assert rows[1][1] == "[codex] 合成 Codex 任务"
     assert all("不可信事件 JSON" in row[2] for row in rows)
     assert all(row[3] == "workspace-example" for row in rows)
@@ -476,7 +476,7 @@ def test_context_token_or_sendmessage_failure_never_creates_followup(
     second = run_once(fixture.config_path, fixture.state_path, now_ms=130000)
     assert first.enqueued == 0
     assert second.enqueued == 0
-    assert fixture.automation_titles() == ["合成 ZCode 任务"]
+    assert fixture.automation_titles() == ["[zcode] 合成 ZCode 任务"]
 
 
 def test_state_save_failure_keeps_stable_automation_id(tmp_path: Path, monkeypatch):
@@ -500,7 +500,7 @@ def test_state_save_failure_keeps_stable_automation_id(tmp_path: Path, monkeypat
     monkeypatch.setattr(StateStore, "save", real_save)
     second = run_once(fixture.config_path, fixture.state_path, now_ms=160000)
     assert second.enqueued == 1
-    assert fixture.automation_titles() == ["合成 ZCode 任务"]
+    assert fixture.automation_titles() == ["[zcode] 合成 ZCode 任务"]
 
 
 def test_lock_competition_returns_skipped(tmp_path: Path):
@@ -626,8 +626,8 @@ def test_codex_baseline_failure_preserves_source_flag_and_recovery_is_silent(
 
     assert second.enqueued == 1
     assert fixture.automation_titles() == [
-        "合成 ZCode 任务",
-        "合成 ZCode 任务",
+        "[zcode] 合成 ZCode 任务",
+        "[zcode] 合成 ZCode 任务",
     ]
     recovered_state = StateStore(fixture.state_path).load()
     assert recovered_state.source_initialized == {"zcode": True, "codex": True}
