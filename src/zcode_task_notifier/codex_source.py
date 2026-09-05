@@ -11,7 +11,8 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterable, Mapping
 
-from .models import Event, RuntimeState
+from .models import Event, RuntimeState, TurnContext
+from .stop_policy import StopDecision, classify_stop, user_task_evidence
 
 
 class CodexSourceError(RuntimeError):
@@ -56,6 +57,137 @@ class _HistoryRow:
     source: str | None
     started_at_ms: int | None
     identity: str
+
+
+def _context_key(thread_id: str, turn_id: str) -> str:
+    return f"codex:{thread_id}:{turn_id}"
+
+
+def _structured_text(value: Any) -> str:
+    """只提取记录中的文本供本回合判断，不把正文写入 RuntimeState。"""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return "\n".join(part for part in (_structured_text(item) for item in value) if part)
+    if isinstance(value, dict):
+        parts: list[str] = []
+        for key in (
+            "text",
+            "content",
+            "input_text",
+            "inputText",
+            "user_input",
+            "userInput",
+            "message",
+        ):
+            if key in value:
+                part = _structured_text(value[key])
+                if part:
+                    parts.append(part)
+        return "\n".join(parts)
+    return ""
+
+
+def _input_fingerprint(text: str) -> str | None:
+    normalized = " ".join(text.replace("\r", "\n").split())
+    if not normalized:
+        return None
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:24]
+
+
+def _record_user_evidence(
+    ref: RolloutRef,
+    record: Mapping[str, Any],
+    payload: Mapping[str, Any],
+    contexts: dict[str, TurnContext],
+    fallback_turn_id: str | None = None,
+) -> tuple[str | None, bool]:
+    """按记录角色提取真实用户任务证据，忽略 system/developer 环境内容。"""
+    explicit_thread = _event_thread_id(record, payload)
+    if explicit_thread is not None and explicit_thread != ref.thread_id:
+        return None, False
+    record_type = _text(record.get("type"))
+    payload_type = _text(payload.get("type"))
+    role = _text(payload.get("role")) or _text(record.get("role"))
+    is_user = role is not None and role.casefold() == "user"
+    if payload_type in {"user_message", "user_input", "turn_context"}:
+        is_user = True
+    if record_type in {"user_message", "user_input"} or (
+        record_type == "turn_context"
+        and any(key in payload for key in ("user_input", "userInput", "input"))
+    ):
+        is_user = True
+    if not is_user:
+        return None, False
+    turn_id = _event_turn_id(record, payload) or fallback_turn_id
+    if turn_id is None:
+        return None, False
+    text = _structured_text(payload)
+    if not text:
+        text = _structured_text(record)
+    fingerprint = _input_fingerprint(text)
+    task_evidence = user_task_evidence(text)
+    current = contexts.get(_context_key(ref.thread_id, turn_id))
+    if fingerprint is None:
+        return turn_id, bool(current and current.has_user_task)
+    key = _context_key(ref.thread_id, turn_id)
+    # 同一回合可能先出现 Harness 封装、随后才出现真实用户请求；真实证据
+    # 一旦观察到不可被后续规则封装降级。
+    has_user_task = bool(task_evidence or (current and current.has_user_task is True))
+    contexts[key] = TurnContext(
+        source="codex",
+        task_id=ref.thread_id,
+        turn_id=turn_id,
+        has_user_task=has_user_task,
+        input_fingerprint=fingerprint,
+        plan_fingerprint=current.plan_fingerprint if current else None,
+        pending_input_call_id=current.pending_input_call_id if current else None,
+        status=current.status if current else None,
+        active=True,
+        updated_at_ms=current.updated_at_ms if current else 0,
+    )
+    return turn_id, True
+
+
+def _context_task_flag(
+    ref: RolloutRef, turn_id: str | None, contexts: Mapping[str, TurnContext]
+) -> bool | None:
+    if not turn_id:
+        return None
+    context = contexts.get(_context_key(ref.thread_id, turn_id))
+    return None if context is None else context.has_user_task
+
+
+def _remember_decision(
+    ref: RolloutRef,
+    turn_id: str | None,
+    contexts: dict[str, TurnContext],
+    decision: StopDecision,
+    *,
+    active: bool,
+    timestamp_ms: int,
+    pending_input_call_id: str | None = None,
+) -> None:
+    if not turn_id:
+        return
+    key = _context_key(ref.thread_id, turn_id)
+    current = contexts.get(key)
+    contexts[key] = TurnContext(
+        source="codex",
+        task_id=ref.thread_id,
+        turn_id=turn_id,
+        has_user_task=current.has_user_task if current else None,
+        input_fingerprint=current.input_fingerprint if current else None,
+        plan_fingerprint=(
+            decision.plan_fingerprint
+            if decision.status == "awaiting_approval"
+            else None
+        ),
+        pending_input_call_id=pending_input_call_id,
+        status=decision.status,
+        active=active,
+        updated_at_ms=timestamp_ms,
+    )
 
 
 _MAX_TIMESTAMP_MS = 10**15
@@ -731,6 +863,64 @@ def _event_turn_id(record: Mapping[str, Any], payload: Mapping[str, Any]) -> str
     return None
 
 
+def _request_input_call_id(payload: Mapping[str, Any]) -> str | None:
+    """仅接受 Codex 已观察到的 request_user_input 工具名称。"""
+    if _text(payload.get("type")) != "function_call":
+        return None
+    name = _text(payload.get("name"))
+    if name not in {"request_user_input", "functions.request_user_input"}:
+        return None
+    return _text(payload.get("call_id"))
+
+
+def _function_call_output_id(payload: Mapping[str, Any]) -> str | None:
+    if _text(payload.get("type")) != "function_call_output":
+        return None
+    return _text(payload.get("call_id"))
+
+
+def _clear_pending_input(
+    ref: RolloutRef,
+    turn_id: str | None,
+    contexts: dict[str, TurnContext],
+    timestamp_ms: int,
+) -> None:
+    """用户已回答工具提问后，将回合从 waiting 恢复为执行中。"""
+    if not turn_id:
+        return
+    key = _context_key(ref.thread_id, turn_id)
+    current = contexts.get(key)
+    if current is None:
+        return
+    contexts[key] = TurnContext(
+        source="codex",
+        task_id=ref.thread_id,
+        turn_id=turn_id,
+        has_user_task=current.has_user_task,
+        input_fingerprint=current.input_fingerprint,
+        plan_fingerprint=current.plan_fingerprint,
+        pending_input_call_id=None,
+        status="running",
+        active=True,
+        updated_at_ms=timestamp_ms,
+    )
+
+
+def _pending_input_turn(
+    ref: RolloutRef,
+    call_id: str,
+    contexts: Mapping[str, TurnContext],
+) -> str | None:
+    for context in contexts.values():
+        if (
+            context.source == "codex"
+            and context.task_id == ref.thread_id
+            and context.pending_input_call_id == call_id
+        ):
+            return context.turn_id
+    return None
+
+
 def _stable_missing_turn(
     thread_id: str,
     completed_at_ms: int,
@@ -743,35 +933,111 @@ def _record_event(
     ref: RolloutRef,
     record: Mapping[str, Any],
     starts: dict[str, int],
+    contexts: dict[str, TurnContext],
+    fallback_turn_id: str | None = None,
 ) -> Event | None:
-    if record.get("type") != "event_msg":
+    if record.get("type") not in {
+        "event_msg",
+        "task_waiting",
+        "task_complete",
+        "response_item",
+    }:
         return None
     payload = record.get("payload")
     if not isinstance(payload, dict):
         return None
+    _record_user_evidence(ref, record, payload, contexts, fallback_turn_id)
     event_type = _text(payload.get("type"))
+    request_input_call_id = _request_input_call_id(payload)
+    if request_input_call_id is not None:
+        event_type = "request_user_input"
     explicit_thread = _event_thread_id(record, payload)
     if explicit_thread is not None and explicit_thread != ref.thread_id:
         return None
-    turn_id = _event_turn_id(record, payload)
+    turn_id = _event_turn_id(record, payload) or fallback_turn_id
     if event_type == "task_started":
         started_at_ms = _iso_timestamp_ms(record.get("timestamp"))
         if turn_id and started_at_ms is not None:
             starts.setdefault(f"{ref.thread_id}:{turn_id}", started_at_ms)
+        if turn_id:
+            current = contexts.get(_context_key(ref.thread_id, turn_id))
+            contexts[_context_key(ref.thread_id, turn_id)] = TurnContext(
+                source="codex",
+                task_id=ref.thread_id,
+                turn_id=turn_id,
+                has_user_task=current.has_user_task if current else None,
+                input_fingerprint=current.input_fingerprint if current else None,
+                plan_fingerprint=current.plan_fingerprint if current else None,
+                pending_input_call_id=None,
+                status="running",
+                active=True,
+                updated_at_ms=started_at_ms or (current.updated_at_ms if current else 0),
+            )
         return None
-    if event_type != "task_complete":
+    if event_type not in {
+        "task_complete",
+        "task_waiting",
+        "awaiting_input",
+        "awaiting_approval",
+        "task_paused",
+        "request_user_input",
+    }:
         return None
     completed_at_ms = _iso_timestamp_ms(record.get("timestamp"))
     if completed_at_ms is None:
         return None
-    message = _message_text(
-        payload.get("last_agent_message", payload.get("lastAgentMessage", ""))
-    )
+    message_value = payload.get("last_agent_message", payload.get("lastAgentMessage", ""))
+    if event_type == "request_user_input" and not message_value:
+        message_value = payload.get("arguments", payload.get("question", ""))
+    message = _message_text(message_value)
     normalized_message = _normalise_message(message)
     if turn_id is None:
         turn_id = _stable_missing_turn(ref.thread_id, completed_at_ms, normalized_message)
+    structured_status = _text(payload.get("status"))
+    if event_type in {
+        "task_waiting",
+        "awaiting_input",
+        "awaiting_approval",
+        "task_paused",
+        "request_user_input",
+    }:
+        structured_status = structured_status or "waiting"
+    decision = classify_stop(
+        message,
+        structured_status=structured_status,
+        has_user_task=_context_task_flag(ref, turn_id, contexts),
+        event_type=event_type,
+        explicit_final=event_type == "task_complete",
+    )
+    _remember_decision(
+        ref,
+        turn_id,
+        contexts,
+        decision,
+        active=(
+            decision.status in {"awaiting_approval", "awaiting_input"}
+            or event_type
+            in {
+                "task_waiting",
+                "awaiting_input",
+                "awaiting_approval",
+                "task_paused",
+                "request_user_input",
+            }
+        ),
+        timestamp_ms=completed_at_ms,
+        pending_input_call_id=(
+            request_input_call_id if event_type == "request_user_input" else None
+        ),
+    )
+    if decision.status is None:
+        return None
     final_hash = hashlib.sha256(normalized_message.encode("utf-8")).hexdigest()
-    key = f"codex:{ref.thread_id}:{turn_id}:{final_hash}"
+    if decision.status == "completed":
+        # 兼容 V1 完成事件键，避免升级后重复首发。
+        key = f"codex:{ref.thread_id}:{turn_id}:{final_hash}"
+    else:
+        key = f"codex:{ref.thread_id}:{turn_id}:{decision.status}:{final_hash}"
     started_at_ms = starts.get(f"{ref.thread_id}:{turn_id}")
     duration_ms = (
         completed_at_ms - started_at_ms
@@ -786,6 +1052,9 @@ def _record_event(
         completed_at_ms=completed_at_ms,
         duration_ms=duration_ms,
         summary_text=_tail_text(message),
+        status=decision.status,
+        stop_reason=decision.stop_reason,
+        plan_fingerprint=decision.plan_fingerprint,
         turn_id=turn_id,
     )
 
@@ -794,9 +1063,22 @@ def _scan_rollout(
     ref: RolloutRef,
     offset: int,
     starts: dict[str, int],
+    contexts: dict[str, TurnContext],
 ) -> tuple[list[Event], int]:
     lines, new_offset = _read_complete_lines(ref.path, offset)
     events_by_key: dict[str, Event] = {}
+    pending_call_events: dict[str, tuple[str | None, str | None]] = {}
+    answered_call_ids: set[str] = set()
+    active_turn_id: str | None = None
+    known_active = [
+        context
+        for context in contexts.values()
+        if context.source == "codex"
+        and context.task_id == ref.thread_id
+        and context.active
+    ]
+    if known_active:
+        active_turn_id = max(known_active, key=lambda context: context.updated_at_ms).turn_id
     for raw in lines:
         try:
             record = json.loads(raw.decode("utf-8"))
@@ -806,9 +1088,64 @@ def _scan_rollout(
             raise CodexSourceError("Codex rollout 记录不是有效 JSON") from exc
         if not isinstance(record, dict):
             continue
-        event = _record_event(ref, record, starts)
+        payload = record.get("payload")
+        if isinstance(payload, dict):
+            explicit_thread = _event_thread_id(record, payload)
+            if explicit_thread is not None and explicit_thread != ref.thread_id:
+                continue
+        payload_type = _text(payload.get("type")) if isinstance(payload, dict) else None
+        record_turn_id = (
+            _event_turn_id(record, payload)
+            if isinstance(payload, dict)
+            else None
+        )
+        if payload_type == "task_started" and record_turn_id:
+            active_turn_id = record_turn_id
+        if isinstance(payload, dict):
+            _record_user_evidence(ref, record, payload, contexts, active_turn_id)
+            output_call_id = _function_call_output_id(payload)
+            if output_call_id is not None:
+                answered_call_ids.add(output_call_id)
+                pending = pending_call_events.pop(output_call_id, None)
+                turn_id = pending[0] if pending is not None else None
+                if turn_id is None:
+                    turn_id = _pending_input_turn(ref, output_call_id, contexts)
+                if turn_id is None and record_turn_id:
+                    turn_id = record_turn_id
+                timestamp_ms = _iso_timestamp_ms(record.get("timestamp"))
+                if timestamp_ms is not None:
+                    _clear_pending_input(ref, turn_id, contexts, timestamp_ms)
+                if pending is not None and pending[1] is not None:
+                    events_by_key.pop(pending[1], None)
+                elif turn_id is not None:
+                    for key, event in list(events_by_key.items()):
+                        if (
+                            event.task_id == ref.thread_id
+                            and event.turn_id == turn_id
+                            and event.status == "awaiting_input"
+                        ):
+                            events_by_key.pop(key, None)
+                continue
+            request_call_id = _request_input_call_id(payload)
+            if request_call_id is not None and request_call_id in answered_call_ids:
+                # 仅防止异常乱序记录把已经返回的工具调用重新变成 waiting。
+                continue
+        event = _record_event(ref, record, starts, contexts, active_turn_id)
         if event is not None:
             events_by_key[event.key] = event
+            if event.status == "awaiting_input":
+                request_call_id = (
+                    _request_input_call_id(payload)
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if request_call_id is not None:
+                    pending_call_events[request_call_id] = (event.turn_id, event.key)
+        elif isinstance(payload, dict):
+            request_call_id = _request_input_call_id(payload)
+            if request_call_id is not None:
+                turn_id = _event_turn_id(record, payload) or active_turn_id
+                pending_call_events[request_call_id] = (turn_id, None)
     return list(events_by_key.values()), new_offset
 
 
@@ -860,7 +1197,21 @@ def _load_history_rows(
                 )
                 final_value = _history_final_value(row, final_column)
                 final_text = _text(final_value)
-                if not thread_id or status is None or status.casefold() != "completed":
+                if not thread_id or status is None or status.casefold() not in {
+                    "completed",
+                    "complete",
+                    "success",
+                    "succeeded",
+                    "error",
+                    "failed",
+                    "failure",
+                    "waiting",
+                    "awaiting",
+                    "awaiting_input",
+                    "awaiting_approval",
+                    "paused",
+                    "blocked",
+                }:
                     continue
                 if completed_at_ms is None or final_text is None:
                     continue
@@ -902,13 +1253,31 @@ def _load_history_rows(
         connection.close()
 
 
-def _history_event(row: _HistoryRow, starts: Mapping[str, int]) -> Event:
+def _history_event(
+    row: _HistoryRow,
+    starts: Mapping[str, int],
+    contexts: Mapping[str, TurnContext] | None = None,
+) -> Event | None:
     turn_id = row.turn_id
     normalized_message = _normalise_message(row.final_message)
     if turn_id is None:
         turn_id = _stable_missing_turn(row.thread_id, row.completed_at_ms, normalized_message)
+    context = (contexts or {}).get(_context_key(row.thread_id, turn_id))
+    decision = classify_stop(
+        row.final_message,
+        structured_status=row.status,
+        has_user_task=context.has_user_task if context else None,
+        explicit_final=row.status.casefold() in {
+            "completed", "complete", "success", "succeeded", "error", "failed", "failure"
+        },
+    )
+    if decision.status is None:
+        return None
     final_hash = hashlib.sha256(normalized_message.encode("utf-8")).hexdigest()
-    key = f"codex:{row.thread_id}:{turn_id}:{final_hash}"
+    if decision.status == "completed":
+        key = f"codex:{row.thread_id}:{turn_id}:{final_hash}"
+    else:
+        key = f"codex:{row.thread_id}:{turn_id}:{decision.status}:{final_hash}"
     started_at_ms = starts.get(f"{row.thread_id}:{turn_id}") or row.started_at_ms
     duration_ms = (
         row.completed_at_ms - started_at_ms
@@ -923,6 +1292,9 @@ def _history_event(row: _HistoryRow, starts: Mapping[str, int]) -> Event:
         completed_at_ms=row.completed_at_ms,
         duration_ms=duration_ms,
         summary_text=_tail_text(row.final_message),
+        status=decision.status,
+        stop_reason=decision.stop_reason,
+        plan_fingerprint=decision.plan_fingerprint,
         turn_id=turn_id,
     )
 
@@ -933,6 +1305,10 @@ def _codex_pairs_from_seen(keys: Iterable[str]) -> set[tuple[str, str]]:
     for key in keys:
         parts = key.split(":")
         if len(parts) < 4 or parts[0] != "codex":
+            continue
+        # waiting 只是可撤销的中间停顿；同一回合随后可能已收到答案，
+        # 不能用它压掉历史库中的最终完成记录。
+        if len(parts) >= 5 and parts[3] in {"awaiting_input", "awaiting_approval"}:
             continue
         if parts[1] and parts[2]:
             result.add((parts[1], parts[2]))
@@ -951,6 +1327,7 @@ def scan_codex_events(
     offsets = dict(state.rollout_offsets)
     identities = dict(state.rollout_identities)
     starts = dict(state.rollout_turn_started_ms)
+    contexts = dict(state.turn_contexts)
     events: list[Event] = []
     emitted_keys: set[str] = set()
     rollout_pairs: set[tuple[str, str]] = _codex_pairs_from_seen(state.seen_event_keys)
@@ -982,7 +1359,7 @@ def scan_codex_events(
             old_offset = offsets.get(path_key, 0)
             if previous_identity is not None and current_identity != previous_identity:
                 old_offset = 0
-            rollout_events, new_offset = _scan_rollout(ref, old_offset, starts)
+            rollout_events, new_offset = _scan_rollout(ref, old_offset, starts, contexts)
             successful_file_reads = True
             identities[path_key] = current_identity
             offsets[path_key] = new_offset
@@ -993,7 +1370,7 @@ def scan_codex_events(
             )
             continue
         for event in rollout_events:
-            if event.turn_id is not None:
+            if event.turn_id is not None and event.status in {"completed", "error"}:
                 rollout_pairs.add((event.task_id, event.turn_id))
             if event.key in emitted_keys or event.key in state.seen_event_keys:
                 continue
@@ -1014,7 +1391,20 @@ def scan_codex_events(
             _LOGGER.warning("codex 可选历史库处理失败: %s", type(exc).__name__)
         history_keys: set[str] = set()
         for row in history_rows:
-            event = _history_event(row, starts)
+            event = _history_event(row, starts, contexts)
+            if event is None:
+                continue
+            if event.turn_id and event.status in {"completed", "error"}:
+                context_key = _context_key(event.task_id, event.turn_id)
+                previous = contexts.get(context_key)
+                if previous is None or previous.updated_at_ms <= event.completed_at_ms:
+                    # 历史补全也推进终态，撤销此前还未首发的等待通知。
+                    contexts[context_key] = TurnContext(
+                        source="codex", task_id=event.task_id, turn_id=event.turn_id,
+                        has_user_task=previous.has_user_task if previous else None,
+                        input_fingerprint=previous.input_fingerprint if previous else None,
+                        status=event.status, active=False, updated_at_ms=event.completed_at_ms,
+                    )
             if (event.task_id, event.turn_id) in rollout_pairs:
                 continue
             if event.key in history_keys or event.key in emitted_keys or event.key in state.seen_event_keys:
@@ -1026,6 +1416,17 @@ def scan_codex_events(
                 events.append(event)
 
     state.rollout_identities = identities
+    state.turn_contexts = contexts
+    events = [
+        event for event in events
+        if event.status not in {"awaiting_approval", "awaiting_input"}
+        or not any(
+            context.task_id == event.task_id and context.turn_id == event.turn_id
+            and context.status in {"completed", "error"}
+            and context.updated_at_ms >= event.completed_at_ms
+            for context in contexts.values()
+        )
+    ]
     if diagnostics and not (successful_file_reads or events):
         raise diagnostics[0]
     return events, offsets, starts
@@ -1047,6 +1448,7 @@ def backfill_codex_thread(
         raise CodexSourceError("未找到指定 Codex thread 的 rollout")
 
     starts: dict[str, int] = {}
+    contexts: dict[str, TurnContext] = {}
     all_events: list[tuple[int, Event]] = []
     scanned_paths: set[str] = set()
     sequence = 0
@@ -1058,7 +1460,7 @@ def backfill_codex_thread(
         scanned_paths.add(path_key)
         if not path.is_file():
             continue
-        rollout_events, _ = _scan_rollout(ref, 0, starts)
+        rollout_events, _ = _scan_rollout(ref, 0, starts, contexts)
         for event in rollout_events:
             all_events.append((sequence, event))
             sequence += 1

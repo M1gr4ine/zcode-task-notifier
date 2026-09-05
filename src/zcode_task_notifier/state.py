@@ -9,7 +9,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .models import Event, OutboxItem, RuntimeState
+from .models import Event, OutboxItem, RuntimeState, TurnContext
 
 try:
     import msvcrt
@@ -52,6 +52,21 @@ def state_to_json(state: RuntimeState) -> dict[str, Any]:
         "zcode_rollout_identities": state.zcode_rollout_identities,
         "rollout_identities": state.rollout_identities,
         "rollout_turn_started_ms": state.rollout_turn_started_ms,
+        "turn_contexts": {
+            key: {
+                "source": context.source,
+                "task_id": context.task_id,
+                "turn_id": context.turn_id,
+                "has_user_task": context.has_user_task,
+                "input_fingerprint": context.input_fingerprint,
+                "plan_fingerprint": context.plan_fingerprint,
+                "pending_input_call_id": context.pending_input_call_id,
+                "status": context.status,
+                "active": context.active,
+                "updated_at_ms": context.updated_at_ms,
+            }
+            for key, context in state.turn_contexts.items()
+        },
         "outbox": {key: _outbox_to_json(item) for key, item in state.outbox.items()},
     }
 
@@ -69,6 +84,10 @@ def _event_from_json(payload: Any) -> Event:
         "summary_text",
         "status",
         "turn_id",
+        "stop_reason",
+        "plan_fingerprint",
+        "agent_id",
+        "session_id",
     }
     values = {name: payload[name] for name in allowed if name in payload}
     required = {"source", "key", "task_id", "title", "completed_at_ms", "duration_ms", "summary_text"}
@@ -86,7 +105,12 @@ def _event_from_json(payload: Any) -> Event:
     if not isinstance(values["summary_text"], str):
         raise StateError("outbox event summary_text 必须是字符串")
     status = values.get("status", "completed")
-    if not isinstance(status, str) or status not in {"completed", "error"}:
+    if not isinstance(status, str) or status not in {
+        "completed",
+        "error",
+        "awaiting_approval",
+        "awaiting_input",
+    }:
         raise StateError("outbox event status 无效")
     if not isinstance(values["completed_at_ms"], int) or isinstance(values["completed_at_ms"], bool):
         raise StateError("outbox event completed_at_ms 必须是非负整数")
@@ -100,6 +124,10 @@ def _event_from_json(payload: Any) -> Event:
     turn_id = values.get("turn_id")
     if turn_id is not None and not isinstance(turn_id, str):
         raise StateError("outbox event turn_id 必须是字符串或 null")
+    for field_name in ("stop_reason", "plan_fingerprint", "agent_id", "session_id"):
+        value = values.get(field_name)
+        if value is not None and not isinstance(value, str):
+            raise StateError(f"outbox event {field_name} 必须是字符串或 null")
     try:
         return Event(**values)
     except (TypeError, ValueError) as exc:
@@ -188,6 +216,71 @@ def state_from_json(payload: Any) -> RuntimeState:
     outbox = {key: _outbox_from_json(item) for key, item in raw_outbox.items() if isinstance(key, str)}
     if len(outbox) != len(raw_outbox):
         raise StateError("outbox 键必须是字符串")
+
+    raw_contexts = payload.get("turn_contexts", {})
+    if not isinstance(raw_contexts, dict):
+        raise StateError("turn_contexts 必须是对象")
+    turn_contexts: dict[str, TurnContext] = {}
+    for key, raw_context in raw_contexts.items():
+        if not isinstance(key, str) or not isinstance(raw_context, dict):
+            raise StateError("turn_contexts 项无效")
+        allowed_context = {
+            "source",
+            "task_id",
+            "turn_id",
+            "has_user_task",
+            "input_fingerprint",
+            "plan_fingerprint",
+            "pending_input_call_id",
+            "status",
+            "active",
+            "updated_at_ms",
+        }
+        if any(name not in allowed_context for name in raw_context):
+            raise StateError("turn_contexts 含未知字段")
+        source = raw_context.get("source")
+        task_id = raw_context.get("task_id")
+        turn_id = raw_context.get("turn_id")
+        if source not in {"zcode", "codex"}:
+            raise StateError("turn_context source 无效")
+        if not isinstance(task_id, str) or not isinstance(turn_id, str):
+            raise StateError("turn_context task/turn 必须是字符串")
+        has_user_task = raw_context.get("has_user_task")
+        active = raw_context.get("active", True)
+        if has_user_task is not None and not isinstance(has_user_task, bool):
+            raise StateError("turn_context has_user_task 无效")
+        if not isinstance(active, bool):
+            raise StateError("turn_context 布尔字段无效")
+        updated_at_ms = raw_context.get("updated_at_ms", 0)
+        if (
+            not isinstance(updated_at_ms, int)
+            or isinstance(updated_at_ms, bool)
+            or updated_at_ms < 0
+        ):
+            raise StateError("turn_context updated_at_ms 无效")
+        optional_values: dict[str, str | None] = {}
+        for name in (
+            "input_fingerprint",
+            "plan_fingerprint",
+            "pending_input_call_id",
+            "status",
+        ):
+            value = raw_context.get(name)
+            if value is not None and not isinstance(value, str):
+                raise StateError(f"turn_context {name} 必须是字符串或 null")
+            optional_values[name] = value
+        turn_contexts[key] = TurnContext(
+            source=source,
+            task_id=task_id,
+            turn_id=turn_id,
+            has_user_task=has_user_task,
+            input_fingerprint=optional_values["input_fingerprint"],
+            plan_fingerprint=optional_values["plan_fingerprint"],
+            pending_input_call_id=optional_values["pending_input_call_id"],
+            status=optional_values["status"],
+            active=active,
+            updated_at_ms=updated_at_ms,
+        )
     initialized = payload.get("initialized", False)
     if not isinstance(initialized, bool):
         raise StateError("initialized 必须是布尔值")
@@ -215,6 +308,7 @@ def state_from_json(payload: Any) -> RuntimeState:
         zcode_rollout_identities=_str_map("zcode_rollout_identities"),
         rollout_identities=_str_map("rollout_identities"),
         rollout_turn_started_ms=_int_map("rollout_turn_started_ms"),
+        turn_contexts=turn_contexts,
         outbox=outbox,
     )
 

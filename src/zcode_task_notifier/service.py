@@ -153,10 +153,11 @@ def _scan_sources(
     state: RuntimeState,
     config: AppConfig,
     baseline: bool | Mapping[str, bool],
-) -> tuple[list[Event], bool, list[str]]:
+) -> tuple[list[Event], bool, list[str], set[str]]:
     events: list[Event] = []
     dirty = False
     errors: list[str] = []
+    refreshed_sources: set[str] = set()
     zcode_baseline = (
         baseline.get("zcode", False) if isinstance(baseline, Mapping) else baseline
     )
@@ -171,6 +172,7 @@ def _scan_sources(
         state.zcode_rollout_offsets = zcode_offsets
         state.zcode_last_turns = zcode_turns
         events.extend(zcode_events)
+        refreshed_sources.add("zcode")
         dirty = True
         if zcode_baseline:
             state.source_initialized["zcode"] = True
@@ -196,6 +198,7 @@ def _scan_sources(
             state.rollout_offsets = rollout_offsets
             state.rollout_turn_started_ms = turn_starts
             events.extend(codex_events)
+            refreshed_sources.add("codex")
             dirty = True
             if codex_baseline:
                 state.source_initialized["codex"] = True
@@ -203,7 +206,7 @@ def _scan_sources(
             if codex_baseline:
                 state.source_initialized["codex"] = False
             errors.append(_source_error("codex", exc))
-    return events, dirty, errors
+    return events, dirty, errors, refreshed_sources
 
 
 def _ensure_source_initialized(state: RuntimeState) -> None:
@@ -247,8 +250,15 @@ def _submit_due_items(
     store: StateStore,
     now_ms: int,
     errors: list[str],
+    *,
+    waiting_sources: set[str] | None = None,
 ) -> tuple[int, bool]:
-    due = [(key, item) for key, item in state.outbox.items() if _item_due(item, now_ms)]
+    due = [
+        (key, item) for key, item in state.outbox.items()
+        if _item_due(item, now_ms)
+        and (item.event.status not in {"awaiting_approval", "awaiting_input"}
+             or waiting_sources is None or item.event.source in waiting_sources)
+    ]
     if not due:
         return 0, True
     target, target_errors = _load_target(paths)
@@ -289,6 +299,29 @@ def _submit_due_items(
             # 停止后续外部写入，避免在状态不可持久化时继续扩大不一致。
             return enqueued, False
     return enqueued, True
+
+
+def _discard_obsolete_waits(state: RuntimeState, refreshed_sources: set[str]) -> bool:
+    """等待首发前重新核对来源；已恢复或被新停顿取代的不再投递。"""
+    changed = False
+    for key, item in list(state.outbox.items()):
+        event = item.event
+        if (item.status != "pending" or event.source not in refreshed_sources
+                or event.status not in {"awaiting_approval", "awaiting_input"}):
+            continue
+        contexts = [context for context in state.turn_contexts.values()
+                    if context.source == event.source and context.task_id == event.task_id]
+        obsolete = any(
+            (context.turn_id == event.turn_id and context.status != event.status)
+            or context.updated_at_ms > event.completed_at_ms
+            for context in contexts
+            if context.updated_at_ms >= event.completed_at_ms
+        )
+        if obsolete:
+            del state.outbox[key]
+            state.seen_event_keys.add(key)
+            changed = True
+    return changed
 
 
 def _execute_once(
@@ -334,7 +367,7 @@ def _execute_once(
             )
         )
         if all_available_baseline:
-            _, source_dirty, source_errors = _scan_sources(
+            _, source_dirty, source_errors, _ = _scan_sources(
                 paths, state, scan_config, baseline=source_baseline
             )
             errors.extend(source_errors)
@@ -350,11 +383,14 @@ def _execute_once(
         if dirty:
             if not _save_state(store, state, errors):
                 return RunReport(0, False, errors)
-        enqueued, persisted = _submit_due_items(paths, state, config, store, now_ms, errors)
+        # 完成/失败首发仍可先恢复；等待类必须先读取本轮恢复信号。
+        enqueued, persisted = _submit_due_items(
+            paths, state, config, store, now_ms, errors, waiting_sources=set()
+        )
         if not persisted:
             return RunReport(enqueued, False, errors)
 
-        events, source_dirty, source_errors = _scan_sources(
+        events, source_dirty, source_errors, refreshed_sources = _scan_sources(
             paths,
             state,
             scan_config,
@@ -372,6 +408,8 @@ def _execute_once(
             )
             dirty = True
 
+        dirty = _discard_obsolete_waits(state, refreshed_sources) or dirty
+
         # outbox 与来源游标必须先保存，之后才允许外部写入。
         if dirty:
             if not _save_state(store, state, errors):
@@ -379,7 +417,9 @@ def _execute_once(
                 # 自动化；否则外部写入成功后状态丢失会造成不可恢复的重复。
                 return RunReport(enqueued, False, errors)
 
-        submitted, persisted = _submit_due_items(paths, state, config, store, now_ms, errors)
+        submitted, persisted = _submit_due_items(
+            paths, state, config, store, now_ms, errors, waiting_sources=refreshed_sources
+        )
         enqueued += submitted
         if not persisted:
             return RunReport(enqueued, False, errors)

@@ -14,7 +14,8 @@ import sqlite3
 import stat
 from typing import Any, Mapping
 
-from .models import Event, RuntimeState
+from .models import Event, RuntimeState, TurnContext
+from .stop_policy import classify_stop, user_task_evidence
 
 
 class ZCodeSchemaError(RuntimeError):
@@ -45,6 +46,8 @@ class _ModelIO:
     duration_ms: int | None
     summary_text: str
     sequence: int
+    has_user_task: bool | None = None
+    explicit_final: bool | None = None
 
 
 def _mapping_value(mapping: Mapping[str, Any], key: str, default: Any = None) -> Any:
@@ -423,6 +426,36 @@ def _duration_ms(payload: Mapping[str, Any], task_row: Mapping[str, Any]) -> int
     return None
 
 
+def _request_task_evidence(payload: Mapping[str, Any]) -> bool | None:
+    """只从实际请求的用户文本提取证据，工具结果和系统正文不算任务。"""
+    request = payload.get("request")
+    if not isinstance(request, dict):
+        return None
+    messages = request.get("messages")
+    if not isinstance(messages, list):
+        return None
+    saw_context = False
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            text = content
+        elif isinstance(content, list):
+            text = "\n".join(
+                str(item.get("text", "")) for item in content
+                if isinstance(item, dict) and item.get("type") in {"text", "input_text"}
+            )
+        else:
+            continue
+        if not text.strip():
+            continue
+        if user_task_evidence(text):
+            return True
+        saw_context = True
+    return False if saw_context else None
+
+
 def _model_io_from_line(raw: bytes, sequence: int, task_row: Mapping[str, Any]) -> _ModelIO | None:
     try:
         payload = json.loads(raw.decode("utf-8"))
@@ -438,17 +471,30 @@ def _model_io_from_line(raw: bytes, sequence: int, task_row: Mapping[str, Any]) 
     completed_at_ms = _parse_timestamp_ms(payload.get("completedAt"))
     if turn_id is None or completed_at_ms is None:
         return None
-    searchable = payload.get("searchable_text")
+    response = payload.get("response")
+    response = response if isinstance(response, dict) else {}
+    # 当前响应优先，索引摘要可能仍属于上一轮。
+    searchable = response.get("text")
+    if not isinstance(searchable, str):
+        searchable = payload.get("searchable_text")
     if not isinstance(searchable, str):
         searchable = payload.get("searchableText")
     if not isinstance(searchable, str):
         searchable = _mapping_value(task_row, "__searchable_text")
+    finish_reason = response.get("finishReason")
+    explicit_final = None
+    if finish_reason in {"stop", "end_turn"}:
+        explicit_final = True
+    if response.get("toolCalls") or finish_reason in {"tool-calls", "tool_use", "length"}:
+        explicit_final = False
     return _ModelIO(
         turn_id=turn_id,
         completed_at_ms=completed_at_ms,
         duration_ms=_duration_ms(payload, task_row),
         summary_text=_tail_text(searchable),
         sequence=sequence,
+        has_user_task=_request_task_evidence(payload),
+        explicit_final=explicit_final,
     )
 
 
@@ -502,7 +548,8 @@ def _make_event(
     status: str,
     task_row: Mapping[str, Any],
     model_io: _ModelIO | None,
-) -> Event:
+    state: RuntimeState,
+) -> Event | None:
     status_value = "error" if status.casefold() == "error" else "completed"
     row_summary = _tail_text(_mapping_value(task_row, "__searchable_text"))
     if model_io is None:
@@ -517,6 +564,32 @@ def _make_event(
         key = _event_key(session_id, model_io.turn_id)
         turn_id = model_io.turn_id
         duration_ms = model_io.duration_ms
+    context_key = f"zcode:{session_id}:{turn_id}" if turn_id else None
+    previous = state.turn_contexts.get(context_key) if context_key else None
+    has_task = model_io.has_user_task if model_io else None
+    if has_task is None and previous is not None:
+        has_task = previous.has_user_task
+    explicit_final = model_io.explicit_final if model_io else None
+    if model_io and model_io.sequence == -1 and previous and previous.status == "in_progress":
+        explicit_final = False
+    decision = classify_stop(
+        summary_text,
+        structured_status=status_value,
+        has_user_task=has_task,
+        explicit_final=explicit_final,
+        event_type="completed",
+    )
+    if context_key and turn_id:
+        state.turn_contexts[context_key] = TurnContext(
+            source="zcode", task_id=session_id, turn_id=turn_id,
+            has_user_task=has_task, plan_fingerprint=decision.plan_fingerprint,
+            status=decision.status or ("in_progress" if explicit_final is False else "ignored"),
+            active=explicit_final is False, updated_at_ms=completed_at_ms,
+        )
+    if decision.status is None:
+        return None
+    if decision.status in {"awaiting_approval", "awaiting_input"}:
+        key = f"{key}:{decision.status}:{decision.plan_fingerprint or decision.stop_reason}"
     return Event(
         source="zcode",
         key=key,
@@ -525,8 +598,10 @@ def _make_event(
         completed_at_ms=completed_at_ms,
         duration_ms=duration_ms,
         summary_text=summary_text,
-        status=status_value,  # type: ignore[arg-type]
+        status=decision.status,
         turn_id=turn_id,
+        stop_reason=decision.stop_reason,
+        plan_fingerprint=decision.plan_fingerprint,
     )
 
 
@@ -661,7 +736,9 @@ def scan_zcode_events(
                 # 有文件但没有有效完整记录则等待下次补齐，避免误报。
                 if model_path is not None and model_path.exists():
                     continue
-                event = _make_event(session_id, title, status, row, None)
+                event = _make_event(session_id, title, status, row, None, state)
+                if event is None:
+                    continue
                 if baseline:
                     state.seen_event_keys.add(event.key)
                 elif event.key not in state.seen_event_keys:
@@ -682,7 +759,9 @@ def scan_zcode_events(
                 continue
 
             for model_io in model_io_records:
-                event = _make_event(session_id, title, status, row, model_io)
+                event = _make_event(session_id, title, status, row, model_io, state)
+                if event is None:
+                    continue
                 if baseline:
                     # 基线扫描不投递，但要把当前终态视作已观察，防止下一轮
                     # 因为只有 last_turn 游标而重新生成历史事件。

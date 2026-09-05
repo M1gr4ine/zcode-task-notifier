@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 
 from zcode_task_notifier.models import RuntimeState
+from zcode_task_notifier.state import state_from_json, state_to_json
 from zcode_task_notifier.codex_source import (
     CodexSourceError,
     RolloutRef,
@@ -127,6 +128,245 @@ def test_task_complete_is_emitted_from_current_rollout(tmp_path: Path):
     ]
     assert events[0].title.startswith("[codex]")
     assert offsets[str(rollout.resolve())] == rollout.stat().st_size
+
+
+def test_rule_confirmation_completion_without_real_user_task_is_ignored(tmp_path: Path):
+    codex_home, state_db, rollout = make_codex_layout(tmp_path, "thread-rules")
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:04:05Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "turn-rules",
+                "last_agent_message": "收到 Harness 规则，等待具体任务",
+            },
+        },
+    )
+
+    events, _, _ = scan_codex_events(
+        codex_home, state_db, None, RuntimeState(initialized=True), baseline=False
+    )
+
+    assert events == []
+
+
+def test_task_complete_with_explicit_user_turn_remains_notifiable(tmp_path: Path):
+    codex_home, state_db, rollout = make_codex_layout(tmp_path, "thread-real")
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:03:05Z",
+            "type": "turn_context",
+            "payload": {
+                "turn_id": "turn-real",
+                "user_input": "请检查项目并修复测试失败",
+            },
+        },
+    )
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:04:05Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_complete",
+                "turn_id": "turn-real",
+                "last_agent_message": "已完成修复并通过测试。",
+            },
+        },
+    )
+
+    events, _, _ = scan_codex_events(
+        codex_home, state_db, None, RuntimeState(initialized=True), baseline=False
+    )
+
+    assert [event.status for event in events] == ["completed"]
+
+
+def test_codex_waiting_approval_and_choice_have_distinct_statuses(tmp_path: Path):
+    codex_home, state_db, rollout = make_codex_layout(tmp_path, "thread-waits")
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:03:05Z",
+            "type": "turn_context",
+            "payload": {"turn_id": "turn-approval", "user_input": "请实现功能"},
+        },
+    )
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:04:05Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_waiting",
+                "turn_id": "turn-approval",
+                "last_agent_message": "计划已列出，请明确回复同意后再执行。",
+            },
+        },
+    )
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:05:05Z",
+            "type": "turn_context",
+            "payload": {"turn_id": "turn-choice", "user_input": "继续实现功能"},
+        },
+    )
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:06:05Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "task_waiting",
+                "turn_id": "turn-choice",
+                "last_agent_message": "有两个方案 A 和 B，请选择一个。",
+            },
+        },
+    )
+
+    events, _, _ = scan_codex_events(
+        codex_home, state_db, None, RuntimeState(initialized=True), baseline=False
+    )
+
+    assert [event.status for event in events] == ["awaiting_approval", "awaiting_input"]
+
+
+def test_request_user_input_function_call_is_structured_input_wait(tmp_path: Path):
+    codex_home, state_db, rollout = make_codex_layout(tmp_path, "thread-input-tool")
+    append_jsonl(rollout, started_record("turn-input-tool", "2026-01-02T03:03:05Z"))
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:03:06Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "请实现这个功能。"}],
+            },
+        },
+    )
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:04:05Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "request_user_input",
+                "call_id": "call-input-tool",
+                "arguments": '{"question":"请选择部署方式"}',
+            },
+        },
+    )
+
+    events, _, _ = scan_codex_events(
+        codex_home, state_db, None, RuntimeState(initialized=True), baseline=False
+    )
+
+    assert len(events) == 1
+    assert events[0].status == "awaiting_input"
+    assert events[0].stop_reason == "input_required"
+
+
+def test_answered_input_clears_persisted_wait_and_does_not_hide_history_completion(
+    tmp_path: Path,
+):
+    codex_home, state_db, rollout = make_codex_layout(tmp_path, "thread-resumed")
+    append_jsonl(rollout, started_record("turn-resumed", "2026-01-02T03:03:05Z"))
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:03:06Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "请实现这个功能。"}],
+            },
+        },
+    )
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:04:05Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": "functions.request_user_input",
+                "call_id": "call-resumed",
+                "arguments": '{"question":"请选择部署方式"}',
+            },
+        },
+    )
+    state = RuntimeState(initialized=True)
+    waiting, offsets, starts = scan_codex_events(
+        codex_home, state_db, None, state, baseline=False
+    )
+    assert [event.status for event in waiting] == ["awaiting_input"]
+    state.seen_event_keys.update(event.key for event in waiting)
+    state.rollout_offsets = offsets
+    state.rollout_turn_started_ms = starts
+    state = state_from_json(state_to_json(state))
+    context = state.turn_contexts["codex:thread-resumed:turn-resumed"]
+    assert context.pending_input_call_id == "call-resumed"
+
+    history_db = codex_home / "thread_history_example.sqlite"
+    connection = sqlite3.connect(history_db)
+    connection.execute(
+        """
+        CREATE TABLE thread_history (
+            row_id INTEGER PRIMARY KEY,
+            thread_id TEXT,
+            turn_id TEXT,
+            status TEXT,
+            completed_at TEXT,
+            final_message TEXT,
+            thread_source TEXT
+        )
+        """
+    )
+    connection.execute(
+        "INSERT INTO thread_history VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (
+            1,
+            "thread-resumed",
+            "turn-resumed",
+            "completed",
+            "2026-01-02T03:05:05Z",
+            "已完成实现。",
+            "user",
+        ),
+    )
+    connection.commit()
+    connection.close()
+    append_jsonl(
+        rollout,
+        {
+            "timestamp": "2026-01-02T03:04:06Z",
+            "type": "response_item",
+            "payload": {
+                "type": "function_call_output",
+                "call_id": "call-resumed",
+                "output": '{"answers":{"choice":{"answers":["A"]}}}',
+            },
+        },
+    )
+
+    events, _, _ = scan_codex_events(
+        codex_home, state_db, history_db, state, baseline=False
+    )
+
+    assert [(event.turn_id, event.status) for event in events] == [
+        ("turn-resumed", "completed")
+    ]
+    context = state.turn_contexts["codex:thread-resumed:turn-resumed"]
+    assert context.pending_input_call_id is None
+    assert context.status == "completed"
 
 
 def test_workspace_rollout_is_discovered_without_state_database(tmp_path: Path):

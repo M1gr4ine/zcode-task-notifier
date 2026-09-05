@@ -6,6 +6,12 @@ from typing import Literal
 
 
 Source = Literal["zcode", "codex"]
+EventStatus = Literal[
+    "completed",
+    "error",
+    "awaiting_approval",
+    "awaiting_input",
+]
 
 
 @dataclass(frozen=True)
@@ -17,8 +23,32 @@ class Event:
     completed_at_ms: int
     duration_ms: int | None
     summary_text: str
-    status: Literal["completed", "error"] = "completed"
+    status: EventStatus = "completed"
     turn_id: str | None = None
+    # 停顿分类元数据只保存稳定原因/指纹，不保存完整用户输入。
+    stop_reason: str | None = None
+    plan_fingerprint: str | None = None
+    # task_id 是公开事件主键；以下字段用于来源适配器保留原始关联，旧事件为空。
+    agent_id: str | None = None
+    session_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TurnContext:
+    """跨扫描保留的最小回合证据，不包含用户输入正文。"""
+
+    source: Source
+    task_id: str
+    turn_id: str
+    # None 表示旧格式/尚未观察到 user 记录，不能与“明确规则输入”混同。
+    has_user_task: bool | None = None
+    input_fingerprint: str | None = None
+    plan_fingerprint: str | None = None
+    status: str | None = None
+    active: bool = True
+    updated_at_ms: int = 0
+    # 仅保留 request_user_input 的不透明 call_id，跨扫描识别已回答调用。
+    pending_input_call_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,3 +99,5 @@ class RuntimeState:
     # 与字节游标配套的稳定文件身份；旧状态没有这些字段时按旧游标兼容。
     zcode_rollout_identities: dict[str, str] = field(default_factory=dict)
     rollout_identities: dict[str, str] = field(default_factory=dict)
+    # source:task:turn -> minimal input/stop evidence; unknown old states default empty.
+    turn_contexts: dict[str, TurnContext] = field(default_factory=dict)

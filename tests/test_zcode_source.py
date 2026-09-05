@@ -180,7 +180,7 @@ def append_model_io(
         "completedAt": completed_at,
         "searchable_text": searchable_text,
         "request": {"text": "synthetic request"},
-        "response": {"text": "synthetic response"},
+        "response": {"text": searchable_text},
     }
     payload.update(extra)
     with path.open("a", encoding="utf-8", newline="") as stream:
