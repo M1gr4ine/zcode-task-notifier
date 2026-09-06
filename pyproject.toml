@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "zcode-task-notifier"
-version = "0.2.2"
+version = "0.2.3"
 description = "ZCode 与可选 Codex 的实际任务停顿外置通知器"
 requires-python = ">=3.10"
 dependencies = []

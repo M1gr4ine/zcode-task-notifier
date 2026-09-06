@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from hashlib import sha256
 import json
 from pathlib import Path
+import re
 import sqlite3
 from types import MappingProxyType
 from typing import Any, Callable, Mapping
@@ -46,6 +47,25 @@ class _Candidate:
 
 
 _AGENT_TAGS = frozenset({"codex", "zcode", "claudecode", "dsh"})
+_NOTIFICATION_ID_PATTERNS = (
+    re.compile(r"automation-tnotify-[0-9a-f]{24}\Z"),
+    re.compile(r"automation-tnotify-(?:zcode|codex)-[0-9a-f]{24}\Z"),
+    re.compile(r"automation-tnotify-[0-9]{13}\Z"),
+)
+
+
+def _normalize_notification_title(value: str) -> str:
+    return re.sub(r"(?<=[。！？；：，、]) +", "", " ".join(value.split()))
+
+
+_NOTIFICATION_TITLE_PREFIXES = tuple(
+    _normalize_notification_title(value)
+    for value in (
+        "你是任务停顿通知摘要助手。 只概括下面这一个停顿事件，不扫描或混入其他任务。",
+        "你是任务完成通知摘要助手。 只概括下面这一个完成事件，不扫描或混入其他任务。",
+        "ZCode 任务完成通知自动化。以下任务有状态更新，请生成微信通知。",
+    )
+)
 _AWAITING_STATUSES = frozenset({"awaiting_approval", "awaiting_input"})
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "error"})
 _ACTIVE_DISPATCH_STATUSES = frozenset(
@@ -139,6 +159,21 @@ def _agent_tag_matches(title: Any) -> bool:
         return False
     normalized = title.casefold()
     return any(f"[{tag}]" in normalized for tag in _AGENT_TAGS)
+
+
+def _notification_id_matches(value: Any) -> bool:
+    """只接受历史通知器使用过的完整 ID 格式。"""
+    return isinstance(value, str) and any(
+        pattern.fullmatch(value) is not None for pattern in _NOTIFICATION_ID_PATTERNS
+    )
+
+
+def _notification_template_matches(title: Any) -> bool:
+    """只接受固定通知模板的开头，白空格归一后仍须严格起始匹配。"""
+    if not isinstance(title, str):
+        return False
+    normalized = _normalize_notification_title(title)
+    return any(normalized.startswith(prefix) for prefix in _NOTIFICATION_TITLE_PREFIXES)
 
 
 def _source_title_matches(source: str, title: Any) -> bool:
@@ -321,9 +356,11 @@ def cleanup_history(
             if not isinstance(task_status, str) or task_status.casefold() not in _TERMINAL_TASK_STATUSES:
                 _record_skip(skipped, "task_status")
                 continue
-            if not _agent_tag_matches(task_title) and not _agent_tag_matches(
-                parent_title
-            ):
+            tagged = _agent_tag_matches(task_title) or _agent_tag_matches(parent_title)
+            fallback = _notification_id_matches(
+                task_automation_id
+            ) and _notification_template_matches(task_title)
+            if not tagged and not fallback:
                 _record_skip(skipped, "agent_tag")
                 continue
             if task_automation_id in awaiting_ids:

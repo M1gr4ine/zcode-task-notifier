@@ -7,6 +7,9 @@ import test_service as fixtures
 from test_history_cleanup import _create_db, _add_candidate, _outbox_item, _deleted_tasks
 
 
+_FALLBACK_TEMPLATE = "你是任务停顿通知摘要助手。 只概括下面这一个停顿事件，不扫描或混入其他任务。"
+
+
 def native_fixture(tmp_path, monkeypatch):
     def create_native_db(path):
         _create_db(path)
@@ -34,6 +37,27 @@ def test_main_loop_cleans_owned_history_before_outbox_expiry(tmp_path, monkeypat
     assert StateStore(fixture.state_path).load().outbox == {}
     assert not (tmp_path / "history-ownership.json").exists()
     assert service.run_once(fixture.config_path, fixture.state_path, now_ms=9 * 86400000).cleanup_deleted == 0
+
+
+def test_main_loop_cleans_untagged_fallback_history_after_parent_automation_removed(
+    tmp_path, monkeypatch
+):
+    fixture = native_fixture(tmp_path, monkeypatch)
+    with sqlite3.connect(fixture.zcode_db) as connection:
+        connection.execute(
+            "UPDATE tasks SET title = ?",
+            (_FALLBACK_TEMPLATE + " 附加内容",),
+        )
+        connection.execute("DELETE FROM automations")
+
+    report = service.run_once(
+        fixture.config_path, fixture.state_path, now_ms=8 * 86400000
+    )
+
+    assert report.cleanup_deleted == 1
+    assert report.cleanup_warnings == []
+    assert report.enqueued == 0
+    assert len(_deleted_tasks(fixture.zcode_db)) == 1
 
 
 def test_explicit_baseline_never_cleans_existing_history(tmp_path, monkeypatch):
